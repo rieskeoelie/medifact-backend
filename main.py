@@ -90,8 +90,23 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 @app.on_event("startup")
 async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        print("✅ Database tables created/verified")
+    except Exception as e:
+        print(f"❌ DB startup error: {e}")
+
+@app.get("/debug/db")
+async def debug_db():
+    try:
+        async with engine.begin() as conn:
+            result = await conn.execute(text("SELECT 1"))
+            return {"db": "ok", "url": DATABASE_URL.split("@")[-1]}
+    except Exception as e:
+        return {"db": "error", "detail": str(e)}
+
+from sqlalchemy import text
 
 # ── AUTH UTILITIES ─────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
