@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update
+from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -106,7 +106,6 @@ async def debug_db():
     except Exception as e:
         return {"db": "error", "detail": str(e)}
 
-from sqlalchemy import text
 
 # ── AUTH UTILITIES ─────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
@@ -566,26 +565,31 @@ def meta_check(results: list[AxisResult]) -> tuple[str, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/auth/register")
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == req.email.lower()))
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="E-mailadres al in gebruik")
-    user = User(
-        email=req.email.lower().strip(),
-        name=req.name.strip(),
-        password_hash=hash_password(req.password),
-        tier="free",
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    token = create_token(user.id, user.email)
-    tier_info = TIERS["free"]
-    return {
-        "token": token,
-        "user": {"id": user.id, "email": user.email, "name": user.name,
-                 "tier": user.tier, "tier_name": tier_info["name"],
-                 "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
-    }
+    try:
+        result = await db.execute(select(User).where(User.email == req.email.lower()))
+        if result.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="E-mailadres al in gebruik")
+        user = User(
+            email=req.email.lower().strip(),
+            name=req.name.strip(),
+            password_hash=hash_password(req.password),
+            tier="free",
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        token = create_token(user.id, user.email)
+        tier_info = TIERS["free"]
+        return {
+            "token": token,
+            "user": {"id": user.id, "email": user.email, "name": user.name,
+                     "tier": user.tier, "tier_name": tier_info["name"],
+                     "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Register error: {str(e)}")
 
 @app.post("/auth/login")
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
