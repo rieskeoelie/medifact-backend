@@ -1,0 +1,23 @@
+# Medifact API — SaaS v3.0 dependencies
+
+# Core
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+httpx>=0.28.0
+pydantic[email]>=2.9.0
+python-dotenv>=1.0.0
+
+# AI
+anthropic>=0.40.0
+
+# Database (PostgreSQL on Railway, SQLite locally for dev)
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+aiosqlite>=0.20.0
+
+# Auth
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3.0
+
+# Payments
+stripe>=11.0.0
