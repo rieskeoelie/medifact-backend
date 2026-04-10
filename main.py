@@ -14,7 +14,7 @@ from anthropic import AsyncAnthropic
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from passlib.context import CryptContext
+import bcrypt as _bcrypt
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update, text
@@ -87,8 +87,6 @@ app.add_middleware(
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 @app.on_event("startup")
 async def startup():
     try:
@@ -110,10 +108,10 @@ async def debug_db():
 
 # ── AUTH UTILITIES ─────────────────────────────────────────────────────────────
 def hash_password(pw: str) -> str:
-    return pwd_ctx.hash(pw)
+    return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt()).decode()
 
 def verify_password(pw: str, hashed: str) -> bool:
-    return pwd_ctx.verify(pw, hashed)
+    return _bcrypt.checkpw(pw.encode(), hashed.encode())
 
 def create_token(user_id: str, email: str) -> str:
     payload = {
