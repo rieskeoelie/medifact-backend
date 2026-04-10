@@ -18,6 +18,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update, text
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -63,9 +64,9 @@ class User(Base):
     stripe_customer_id  = Column(String, nullable=True)
     stripe_sub_id       = Column(String, nullable=True)
     analyses_used       = Column(Integer, default=0)
-    analyses_reset      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    analyses_reset      = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     is_active           = Column(Boolean, default=True)
-    created_at          = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at          = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Analysis(Base):
     __tablename__ = "analyses"
@@ -77,7 +78,7 @@ class Analysis(Base):
     score       = Column(String, nullable=False)   # e.g. "7/8"
     axes_json   = Column(Text, nullable=True)      # full JSON of axis results
     rid         = Column(String, nullable=True)
-    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 # ── APP SETUP ──────────────────────────────────────────────────────────────────
 app = FastAPI(title="Medifact API", version="3.0.0")
