@@ -88,6 +88,16 @@ class Analysis(Base):
     rid         = Column(String, nullable=True)
     created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+class ContactRequest(Base):
+    __tablename__ = "contact_requests"
+    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name       = Column(String, nullable=False)
+    email      = Column(String, nullable=False)
+    message    = Column(Text, nullable=True)
+    plan       = Column(String, nullable=True)
+    status     = Column(String, default="new")   # new | handled
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
 class SharedAnalysis(Base):
     __tablename__ = "shared_analyses"
     id                  = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -997,6 +1007,53 @@ async def admin_stats(
         "new_month":        sum(1 for u in users if (now - u.created_at).total_seconds() < 2592000),
         "tier_counts":      {tier: sum(1 for u in users if u.tier == tier) for tier in TIERS},
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTACT REQUESTS
+# ══════════════════════════════════════════════════════════════════════════════
+class ContactRequestBody(BaseModel):
+    name: str
+    email: str
+    message: Optional[str] = None
+    plan: Optional[str] = None
+
+@app.post("/contact")
+async def submit_contact(req: ContactRequestBody, db: AsyncSession = Depends(get_db)):
+    """Save contact request and notify admin via email."""
+    cr = ContactRequest(name=req.name, email=req.email, message=req.message, plan=req.plan)
+    db.add(cr)
+    await db.commit()
+    # Notify admin
+    html = f"""<h2>Nieuwe aanvraag: {req.plan or 'onbekend plan'}</h2>
+<p><strong>Naam:</strong> {req.name}<br>
+<strong>Email:</strong> {req.email}<br>
+<strong>Plan:</strong> {req.plan or '—'}<br>
+<strong>Bericht:</strong> {req.message or '—'}</p>
+<p><a href="https://medifact.eu/admin">Bekijk in admin panel →</a></p>"""
+    await _send_resend_email(
+        to="richard@medifact.eu",
+        subject=f"📩 Nieuwe aanvraag: {req.plan or 'contact'} — {req.name}",
+        html=html,
+    )
+    return {"ok": True}
+
+@app.get("/admin/contacts")
+async def admin_contacts(_: str = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ContactRequest).order_by(ContactRequest.created_at.desc()))
+    contacts = result.scalars().all()
+    return [{"id": c.id, "name": c.name, "email": c.email, "message": c.message,
+             "plan": c.plan, "status": c.status, "created_at": c.created_at.isoformat()} for c in contacts]
+
+@app.patch("/admin/contacts/{contact_id}")
+async def admin_update_contact(contact_id: str, data: dict, _: str = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ContactRequest).where(ContactRequest.id == contact_id))
+    c = result.scalar_one_or_none()
+    if not c:
+        raise HTTPException(status_code=404, detail="Not found")
+    if "status" in data:
+        c.status = data["status"]
+    await db.commit()
+    return {"ok": True}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHARE ENDPOINTS (#15)
