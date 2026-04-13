@@ -41,7 +41,7 @@ STRIPE_PRICE_ENTERPRISE     = os.environ.get("STRIPE_PRICE_ENTERPRISE", "")
 
 # ── SUBSCRIPTION TIERS ────────────────────────────────────────────────────────
 TIERS = {
-    "free":         {"name": "Gratis",        "analyses": 5,           "price": 0,   "stripe_price": None},
+    "free":         {"name": "Gratis",        "analyses": 10,          "price": 0,   "stripe_price": None},
     "starter":      {"name": "Starter",       "analyses": 50,          "price": 19,  "stripe_price": STRIPE_PRICE_STARTER},
     "professional": {"name": "Professional",  "analyses": 200,         "price": 49,  "stripe_price": STRIPE_PRICE_PROFESSIONAL},
     "enterprise":   {"name": "Enterprise",    "analyses": 999999,      "price": 149, "stripe_price": STRIPE_PRICE_ENTERPRISE},
