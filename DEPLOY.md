@@ -1,137 +1,149 @@
-# Medifact API — Deploy Gids
+# Medifact API — Deploy & Configuratie
 
-## Wat heb je nodig?
-- **Anthropic API-sleutel** → [console.anthropic.com](https://console.anthropic.com)
-- **Python 3.10+** (alleen voor lokaal) → [python.org/downloads](https://www.python.org/downloads/)
-- **Railway account** (gratis, alleen voor online) → [railway.app](https://railway.app)
+FastAPI backend voor het Medifact Evidence Intelligence Platform.
 
----
-
-## ⚡ Optie A — Lokaal draaien (snelste, geen account nodig)
-
-### Mac / Linux — dubbelklik of run:
-```bash
-bash run.sh
-```
-
-### Windows — dubbelklik:
-```
-run.bat
-```
-
-Het script vraagt eenmalig om je Anthropic API-sleutel en slaat die op in `.env`.
-De API draait daarna op **http://localhost:8000**.
-
-Zet daarna in `medifact.html`:
-```javascript
-const backendUrl = 'http://localhost:8000';
-```
+**Live:** `https://powerful-creation-production.up.railway.app`
 
 ---
 
-## 🚀 Optie B — Online via Railway (bereikbaar overal, gratis tier)
+## Stack
 
-### Volledig automatisch — run eenmalig:
-```bash
-bash deploy-railway.sh
-```
-Het script installeert Railway CLI, logt je in (browser), maakt het project aan,
-zet de API-sleutel als geheime variabele en deployt. Je krijgt aan het eind een URL.
-
-Zet die URL daarna in `medifact.html`:
-```javascript
-const backendUrl = 'https://medifact-api.up.railway.app';
-```
-
-**Updates deployen** (na wijzigingen):
-```bash
-railway up --detach
-```
-
-**Kosten:** Railway free tier = $5 credit/maand — ruim genoeg voor persoonlijk gebruik.
+- **Framework:** FastAPI (Python 3.11)
+- **Database:** PostgreSQL via async SQLAlchemy + asyncpg
+- **AI:** Anthropic Claude (claude-haiku-4-5-20251001)
+- **Email:** Resend API (via httpx)
+- **Auth:** JWT (python-jose)
+- **Server:** Uvicorn
+- **Hosting:** Railway
 
 ---
 
-## Render (alternatief, ook gratis)
+## Omgevingsvariabelen (Railway)
 
-1. Maak account op https://render.com
-2. "New" → "Web Service" → koppel repo
-3. Build Command: `pip install -r requirements.txt`
-4. Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. Voeg environment variable toe: `ANTHROPIC_API_KEY`
-6. Deploy
-
----
-
-## Frontend koppelen
-
-In `medifact.html`, ga naar de **API & Integraties** view en vul in:
-
-```
-Backend URL: https://jouw-url.railway.app
-```
-
-De frontend gebruikt dan automatisch de SSE stream (`/api/analyze/stream`) voor real-time resultaten. Zonder backend URL valt het terug op directe PubMed-calls vanuit de browser.
+| Variabele | Beschrijving | Verplicht |
+|-----------|-------------|-----------|
+| `ANTHROPIC_API_KEY` | Claude API key | Ja |
+| `DATABASE_URL` | PostgreSQL connection string | Ja |
+| `JWT_SECRET` | Geheime sleutel voor JWT tokens | Ja |
+| `ADMIN_SECRET` | Wachtwoord voor admin endpoints | Ja |
+| `RESEND_API_KEY` | Resend API key voor emails | Ja |
+| `CRON_SECRET` | Bearer token voor cron endpoints | Ja |
+| `FROM_EMAIL` | Afzenderadres (bijv. noreply@medifact.eu) | Nee (default: noreply@medifact.eu) |
+| `FRONTEND_URL` | URL van de frontend | Nee (default: http://localhost:8000) |
+| `PORT` | Poort voor uvicorn | Nee (default: 8000) |
 
 ---
 
 ## API Endpoints
 
+### Authenticatie
 | Endpoint | Methode | Beschrijving |
 |----------|---------|--------------|
-| `/` | GET | Status |
-| `/health` | GET | Health check + API key status |
-| `/docs` | GET | Swagger UI |
+| `/auth/register` | POST | Nieuw account aanmaken |
+| `/auth/login` | POST | Inloggen, ontvangt JWT token |
+| `/auth/me` | GET | Huidig gebruikersprofiel ophalen |
+
+### Analyses
+| Endpoint | Methode | Beschrijving |
+|----------|---------|--------------|
 | `/api/analyze` | POST | Volledige analyse (wacht op alle 8 assen) |
-| `/api/analyze/stream` | GET | SSE stream — resultaten per as zodra ze klaar zijn |
+| `/api/analyze/stream` | GET | SSE stream — resultaten per as real-time |
+| `/analyses` | POST | Analyse opslaan + gebruik teller ophogen |
+| `/analyses` | GET | Opgeslagen analyses ophalen (max 8) |
 
-### POST /api/analyze
-```json
-{
-  "query": "COVID-19 mRNA vaccins",
-  "profile": "medical"
-}
+### Billing
+| Endpoint | Methode | Beschrijving |
+|----------|---------|--------------|
+| `/billing/checkout` | POST | Stripe checkout sessie aanmaken |
+| `/billing/webhook` | POST | Stripe webhook handler |
+
+### Cron (beveiligd met CRON_SECRET)
+| Endpoint | Methode | Beschrijving |
+|----------|---------|--------------|
+| `/cron/weekly-digest` | POST | Digest email versturen naar alle gebruikers |
+| `/cron/test-email` | POST | Testmail versturen naar één adres |
+
+### Admin (beveiligd met ADMIN_SECRET)
+| Endpoint | Methode | Beschrijving |
+|----------|---------|--------------|
+| `/admin/users` | GET | Alle gebruikers ophalen |
+| `/admin/users/:id` | PATCH | Gebruiker bijwerken (tier, limiet, etc.) |
+
+### Systeem
+| Endpoint | Methode | Beschrijving |
+|----------|---------|--------------|
+| `/` | GET | Service info |
+| `/health` | GET | Health check + config status |
+| `/docs` | GET | Swagger UI |
+
+---
+
+## Lokaal draaien
+
+```bash
+# Installeer dependencies
+pip install -r requirements.txt
+
+# Maak .env aan
+cat > .env << EOF
+ANTHROPIC_API_KEY=sk-ant-...
+DATABASE_URL=sqlite+aiosqlite:///./medifact.db
+JWT_SECRET=local-dev-secret
+ADMIN_SECRET=local-admin
+RESEND_API_KEY=re_...
+CRON_SECRET=local-cron-secret
+FROM_EMAIL=noreply@medifact.eu
+FRONTEND_URL=http://localhost:3000
+EOF
+
+# Start server
+uvicorn main:app --reload --port 8000
 ```
 
-### GET /api/analyze/stream
-```
-GET /api/analyze/stream?query=COVID-19+mRNA+vaccins&profile=medical
-Content-Type: text/event-stream
+API draait op [http://localhost:8000](http://localhost:8000).
+Swagger UI op [http://localhost:8000/docs](http://localhost:8000/docs).
 
-data: {"type": "axis_result", "axis": "A1", "status": "pass", "score": "21k+", ...}
-data: {"type": "axis_result", "axis": "A3", "status": "pass", "score": "4%", ...}
-...
-data: {"type": "done", "gate": "open", "score": "8/8", "rid": "Medifact-4f3a8c2e", ...}
+---
+
+## Deployment (Railway)
+
+Automatisch via GitHub push naar `main`. Railway bouwt en deployt de FastAPI app.
+
+**Start command** (ingesteld in `railway.toml`):
 ```
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+---
+
+## Tiers & limieten
+
+| Tier | Analyses/maand | Stripe Price ID |
+|------|---------------|-----------------|
+| `free` | 10 | — |
+| `pro` | 100 | Configureerbaar |
+| `enterprise` | 999999 (onbeperkt) | Configureerbaar |
+
+---
+
+## Wekelijkse digest (cron)
+
+De digest wordt elke maandag om 08:00 verstuurd via **cron-job.org**:
+
+- **URL:** `POST https://powerful-creation-production.up.railway.app/cron/weekly-digest`
+- **Header:** `Authorization: Bearer <CRON_SECRET>`
+- **Schema:** `0 8 * * 1` (Europe/Amsterdam)
+
+De email bevat: gebruikersnaam, tier, analyses gebruikt/limiet, en een CTA naar het dashboard.
+Het `medifact.eu` domein is geverifieerd in Resend.
 
 ---
 
 ## Kosten per analyse
 
-| Model | A1/A2/A8 | A3/A4/A5/A6/A7 | Totaal |
-|-------|----------|-----------------|--------|
-| claude-haiku-4-5 | gratis (PubMed) | ~$0.004 per as | ~$0.02 |
-| claude-sonnet-4-6 | gratis (PubMed) | ~$0.05 per as | ~$0.25 |
+| Model | Kosten |
+|-------|--------|
+| claude-haiku-4-5 | ~€0.02 per analyse |
+| claude-sonnet-4-x | ~€0.25 per analyse |
 
-Bij haiku: 1000 analyses/maand ≈ $20.
-
----
-
-## Model kiezen
-
-In `.env` of Railway environment:
-- `MEDIFACT_MODEL=claude-haiku-4-5-20251001` — snel (5-8 sec totaal), goedkoop, goed voor volume
-- `MEDIFACT_MODEL=claude-sonnet-4-6` — precisie voor A3 consensusanalyse, aanbevolen voor enterprise
-
----
-
-## CORS & beveiliging
-
-In productie kun je CORS beperken tot jouw frontend-domein:
-
-```python
-# In main.py, vervang allow_origins=["*"] met:
-allow_origins=["https://jouw-frontend.vercel.app"]
-```
-
-Voeg eventueel een API key middleware toe voor authenticatie.
+Bij haiku: 1000 analyses/maand ≈ €20.
