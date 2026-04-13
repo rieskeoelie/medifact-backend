@@ -1197,11 +1197,12 @@ def _digest_html(user_name: str, tier_name: str, used: int, limit: int) -> str:
 </html>"""
 
 
-async def _send_resend_email(to: str, subject: str, html: str) -> bool:
-    """Send email via Resend API. Returns True on success."""
+async def _send_resend_email(to: str, subject: str, html: str) -> tuple[bool, str]:
+    """Send email via Resend API. Returns (success, error_message)."""
     if not RESEND_API_KEY:
-        print(f"[Digest] RESEND_API_KEY not set — skipping email to {to}")
-        return False
+        msg = f"RESEND_API_KEY not set"
+        print(f"[Digest] {msg} — skipping email to {to}")
+        return False, msg
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
@@ -1210,12 +1211,14 @@ async def _send_resend_email(to: str, subject: str, html: str) -> bool:
                 json={"from": f"Medifact <{FROM_EMAIL}>", "to": [to], "subject": subject, "html": html},
             )
             if resp.status_code not in (200, 201):
-                print(f"[Digest] Resend error {resp.status_code}: {resp.text}")
-                return False
-            return True
+                msg = f"Resend {resp.status_code}: {resp.text}"
+                print(f"[Digest] Error for {to}: {msg}")
+                return False, msg
+            return True, ""
     except Exception as e:
-        print(f"[Digest] Email send failed: {e}")
-        return False
+        msg = str(e)
+        print(f"[Digest] Email send failed for {to}: {msg}")
+        return False, msg
 
 
 @app.post("/cron/weekly-digest")
@@ -1228,7 +1231,6 @@ async def weekly_digest(
     Protected by CRON_SECRET header: Authorization: Bearer <CRON_SECRET>
     Call from Railway cron: POST /cron/weekly-digest weekly.
     """
-    # Verify cron secret
     auth = request.headers.get("authorization", "")
     if CRON_SECRET and auth != f"Bearer {CRON_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1238,6 +1240,7 @@ async def weekly_digest(
 
     sent = 0
     failed = 0
+    errors: list[str] = []
     for u in users:
         tier_info = TIERS.get(u.tier, TIERS["free"])
         limit = tier_info["analyses"]
@@ -1247,7 +1250,7 @@ async def weekly_digest(
             used=u.analyses_used,
             limit=limit,
         )
-        ok = await _send_resend_email(
+        ok, err = await _send_resend_email(
             to=u.email,
             subject="📊 Jouw wekelijkse Medifact digest",
             html=html,
@@ -1256,5 +1259,32 @@ async def weekly_digest(
             sent += 1
         else:
             failed += 1
+            if err and err not in errors:
+                errors.append(err)
 
-    return {"sent": sent, "failed": failed, "total": len(users)}
+    return {"sent": sent, "failed": failed, "total": len(users), "errors": errors}
+
+
+@app.post("/cron/test-email")
+async def test_email(
+    request: Request,
+):
+    """Send a single test email to verify Resend config. Protected by CRON_SECRET."""
+    auth = request.headers.get("authorization", "")
+    if CRON_SECRET and auth != f"Bearer {CRON_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    body = await request.json()
+    to = body.get("to", "")
+    if not to:
+        raise HTTPException(status_code=400, detail="to field required")
+    ok, err = await _send_resend_email(
+        to=to,
+        subject="✉️ Medifact email test",
+        html="<p>Test email van Medifact. Als je dit ziet werkt Resend correct!</p>",
+    )
+    return {
+        "success": ok,
+        "error": err,
+        "resend_api_key_set": bool(RESEND_API_KEY),
+        "from_email": FROM_EMAIL,
+    }
