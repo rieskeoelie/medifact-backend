@@ -26,6 +26,9 @@ from sqlalchemy.orm import DeclarativeBase
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./medifact.db").replace("postgres://", "postgresql+asyncpg://")
 JWT_SECRET        = os.environ.get("JWT_SECRET", "change-this-to-a-random-secret-in-production")
+RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
+CRON_SECRET       = os.environ.get("CRON_SECRET", "")
+FROM_EMAIL        = os.environ.get("FROM_EMAIL", "noreply@medifact.eu")
 JWT_ALGORITHM     = "HS256"
 JWT_EXPIRE_DAYS   = 30
 FRONTEND_URL      = os.environ.get("FRONTEND_URL", "http://localhost:8000")
@@ -1113,3 +1116,145 @@ async def get_recent_analyses(
         }
         for a in analyses
     ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEEKLY DIGEST EMAIL (#18)
+# ══════════════════════════════════════════════════════════════════════════════
+def _digest_html(user_name: str, tier_name: str, used: int, limit: int) -> str:
+    rem = max(0, limit - used) if limit != 999999 else None
+    pct = min(100, round((used / limit) * 100)) if limit != 999999 else 0
+    bar_color = "#ef4444" if pct >= 90 else "#f59e0b" if pct >= 70 else "#10b981"
+    rem_text = f"{rem} analyses resterend" if rem is not None else "Onbeperkt"
+    limit_text = "∞" if limit == 999999 else str(limit)
+    bar_width = min(100, pct) if limit != 999999 else 0
+
+    upgrade_block = ""
+    if pct >= 80 and limit != 999999:
+        upgrade_block = f"""
+        <tr><td style="padding:0 40px 24px;">
+          <div style="background:#fef3c7;border:1px solid #fbbf24;border-radius:8px;padding:16px 20px;font-size:14px;color:#92400e;">
+            ⚠️ Je zit op {pct}% van je maandlimiet.
+            <a href="https://medifact.eu/dashboard/billing" style="color:#d97706;font-weight:700;text-decoration:none;">Upgrade nu →</a>
+          </div>
+        </td></tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="nl">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Jouw wekelijkse Medifact digest</title></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;padding:40px 0;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1);">
+
+  <!-- Header -->
+  <tr><td style="background:#0f172a;padding:28px 40px;text-align:center;">
+    <span style="font-size:22px;font-weight:900;color:#ffffff;letter-spacing:-.5px;">Medifact</span>
+    <span style="font-size:11px;color:#94a3b8;display:block;margin-top:2px;letter-spacing:.08em;text-transform:uppercase;">Evidence Intelligence</span>
+  </td></tr>
+
+  <!-- Greeting -->
+  <tr><td style="padding:32px 40px 8px;">
+    <p style="font-size:18px;font-weight:700;color:#0f172a;margin:0 0 8px;">Goedemorgen, {user_name} 👋</p>
+    <p style="font-size:14px;color:#64748b;margin:0;">Hier is jouw wekelijkse overzicht van jouw Medifact-gebruik.</p>
+  </td></tr>
+
+  <!-- Usage card -->
+  <tr><td style="padding:20px 40px;">
+    <div style="background:#f1f5f9;border-radius:10px;padding:20px 24px;">
+      <div style="display:flex;justify-content:space-between;margin-bottom:10px;">
+        <span style="font-size:12px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.06em;">Analyses deze maand</span>
+        <span style="font-size:20px;font-weight:900;color:#0f172a;">{used} / {limit_text}</span>
+      </div>
+      <!-- progress bar -->
+      <div style="height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-bottom:8px;">
+        <div style="height:100%;width:{bar_width}%;background:{bar_color};border-radius:4px;"></div>
+      </div>
+      <p style="font-size:13px;color:#64748b;margin:0;">{rem_text} · <strong>{tier_name}</strong></p>
+    </div>
+  </td></tr>
+
+  {upgrade_block}
+
+  <!-- CTA -->
+  <tr><td style="padding:8px 40px 32px;text-align:center;">
+    <a href="https://medifact.eu/dashboard" style="display:inline-block;background:#316BBA;color:#ffffff;font-size:14px;font-weight:700;padding:13px 32px;border-radius:8px;text-decoration:none;">Open Medifact →</a>
+  </td></tr>
+
+  <!-- Footer -->
+  <tr><td style="background:#f8fafc;padding:20px 40px;text-align:center;border-top:1px solid #e2e8f0;">
+    <p style="font-size:12px;color:#94a3b8;margin:0;">
+      Medifact · medifact.eu<br>
+      <a href="https://medifact.eu/dashboard/settings" style="color:#94a3b8;">Afmelden van digest</a>
+    </p>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+
+async def _send_resend_email(to: str, subject: str, html: str) -> bool:
+    """Send email via Resend API. Returns True on success."""
+    if not RESEND_API_KEY:
+        print(f"[Digest] RESEND_API_KEY not set — skipping email to {to}")
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+                json={"from": f"Medifact <{FROM_EMAIL}>", "to": [to], "subject": subject, "html": html},
+            )
+            if resp.status_code not in (200, 201):
+                print(f"[Digest] Resend error {resp.status_code}: {resp.text}")
+                return False
+            return True
+    except Exception as e:
+        print(f"[Digest] Email send failed: {e}")
+        return False
+
+
+@app.post("/cron/weekly-digest")
+async def weekly_digest(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send weekly digest emails to all active users.
+    Protected by CRON_SECRET header: Authorization: Bearer <CRON_SECRET>
+    Call from Railway cron: POST /cron/weekly-digest weekly.
+    """
+    # Verify cron secret
+    auth = request.headers.get("authorization", "")
+    if CRON_SECRET and auth != f"Bearer {CRON_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    result = await db.execute(select(User).where(User.is_active == True))
+    users = result.scalars().all()
+
+    sent = 0
+    failed = 0
+    for u in users:
+        tier_info = TIERS.get(u.tier, TIERS["free"])
+        limit = tier_info["analyses"]
+        html = _digest_html(
+            user_name=u.name or u.email.split("@")[0],
+            tier_name=tier_info["name"],
+            used=u.analyses_used,
+            limit=limit,
+        )
+        ok = await _send_resend_email(
+            to=u.email,
+            subject="📊 Jouw wekelijkse Medifact digest",
+            html=html,
+        )
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+
+    return {"sent": sent, "failed": failed, "total": len(users)}
