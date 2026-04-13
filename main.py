@@ -4,7 +4,7 @@ Medifact — SaaS API v3.0
 Multi-user · Stripe subscriptions · PostgreSQL · 8-axis scientific gate
 """
 
-import asyncio, hashlib, json, os, re, uuid
+import asyncio, hashlib, json, os, re, secrets, uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Annotated
 
@@ -84,6 +84,22 @@ class Analysis(Base):
     axes_json   = Column(Text, nullable=True)      # full JSON of axis results
     rid         = Column(String, nullable=True)
     created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class SharedAnalysis(Base):
+    __tablename__ = "shared_analyses"
+    id                  = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    token               = Column(String, unique=True, nullable=False, index=True,
+                                 default=lambda: secrets.token_urlsafe(16))
+    user_id             = Column(String, nullable=False)
+    sharer_name         = Column(String, nullable=True)
+    query               = Column(String, nullable=False)
+    results_json        = Column(Text, nullable=False)
+    normalize_info_json = Column(Text, nullable=True)
+    verdict             = Column(String, nullable=False)
+    passed              = Column(Integer, nullable=False)
+    created_at          = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at          = Column(DateTime(timezone=True), nullable=False)
+    view_count          = Column(Integer, default=0)
 
 # ── APP SETUP ──────────────────────────────────────────────────────────────────
 app = FastAPI(title="Medifact API", version="3.0.0")
@@ -972,3 +988,94 @@ async def admin_stats(
         "new_month":        sum(1 for u in users if (now - u.created_at).total_seconds() < 2592000),
         "tier_counts":      {tier: sum(1 for u in users if u.tier == tier) for tier in TIERS},
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHARE ENDPOINTS (#15)
+# ══════════════════════════════════════════════════════════════════════════════
+class ShareRequest(BaseModel):
+    query: str
+    results: list
+    normalize_info: Optional[dict] = None
+    verdict: str
+    passed: int
+
+@app.post("/share")
+async def create_share(
+    data: ShareRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a 30-day read-only share link for an analysis."""
+    share = SharedAnalysis(
+        user_id=user.id,
+        sharer_name=user.name,
+        query=data.query,
+        results_json=json.dumps(data.results),
+        normalize_info_json=json.dumps(data.normalize_info) if data.normalize_info else None,
+        verdict=data.verdict,
+        passed=data.passed,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    db.add(share)
+    await db.commit()
+    await db.refresh(share)
+    return {
+        "token": share.token,
+        "expires_at": share.expires_at.isoformat(),
+    }
+
+@app.get("/share/{token}")
+async def get_share(token: str, db: AsyncSession = Depends(get_db)):
+    """Public endpoint — no auth required."""
+    result = await db.execute(select(SharedAnalysis).where(SharedAnalysis.token == token))
+    share = result.scalar_one_or_none()
+    if not share:
+        raise HTTPException(status_code=404, detail="Link niet gevonden of verlopen")
+    now = datetime.now(timezone.utc)
+    exp = share.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if now > exp:
+        raise HTTPException(status_code=410, detail="Deze deellink is verlopen (30 dagen)")
+    # Increment view count
+    share.view_count += 1
+    await db.commit()
+    return {
+        "query": share.query,
+        "results": json.loads(share.results_json),
+        "normalize_info": json.loads(share.normalize_info_json) if share.normalize_info_json else None,
+        "verdict": share.verdict,
+        "passed": share.passed,
+        "sharer_name": share.sharer_name,
+        "created_at": share.created_at.isoformat(),
+        "expires_at": share.expires_at.isoformat(),
+        "view_count": share.view_count,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ACTIVITY FEED (#17)
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/analyses")
+async def get_recent_analyses(
+    limit: int = 10,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return recent analyses for the activity feed."""
+    result = await db.execute(
+        select(Analysis)
+        .where(Analysis.user_id == user.id)
+        .order_by(Analysis.created_at.desc())
+        .limit(limit)
+    )
+    analyses = result.scalars().all()
+    return [
+        {
+            "id": a.id,
+            "query": a.query,
+            "score": a.score,
+            "gate": a.gate,
+            "created_at": a.created_at.isoformat(),
+        }
+        for a in analyses
+    ]
