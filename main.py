@@ -38,13 +38,18 @@ STRIPE_WEBHOOK_SECRET       = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_STARTER        = os.environ.get("STRIPE_PRICE_STARTER", "")    # Set in Railway
 STRIPE_PRICE_PROFESSIONAL   = os.environ.get("STRIPE_PRICE_PROFESSIONAL", "")
 STRIPE_PRICE_ENTERPRISE     = os.environ.get("STRIPE_PRICE_ENTERPRISE", "")
+STRIPE_PRICE_SOLO           = os.environ.get("STRIPE_PRICE_SOLO", "")
+STRIPE_PRICE_TEAM           = os.environ.get("STRIPE_PRICE_TEAM", "")
+STRIPE_PRICE_BUSINESS       = os.environ.get("STRIPE_PRICE_BUSINESS", "")
 
 # ── SUBSCRIPTION TIERS ────────────────────────────────────────────────────────
 TIERS = {
-    "free":         {"name": "Gratis",        "analyses": 10,          "price": 0,   "stripe_price": None},
-    "starter":      {"name": "Starter",       "analyses": 50,          "price": 19,  "stripe_price": STRIPE_PRICE_STARTER},
-    "professional": {"name": "Professional",  "analyses": 200,         "price": 49,  "stripe_price": STRIPE_PRICE_PROFESSIONAL},
-    "enterprise":   {"name": "Enterprise",    "analyses": 999999,      "price": 149, "stripe_price": STRIPE_PRICE_ENTERPRISE},
+    "free":         {"name": "Gratis",       "analyses": 10,     "price": 0,   "seats": 1,      "stripe_price": None},
+    "solo":         {"name": "Solo",         "analyses": 30,     "price": 79,  "seats": 1,      "stripe_price": STRIPE_PRICE_SOLO},
+    "professional": {"name": "Professional", "analyses": 100,    "price": 199, "seats": 1,      "stripe_price": STRIPE_PRICE_PROFESSIONAL},
+    "team":         {"name": "Team",         "analyses": 200,    "price": 399, "seats": 5,      "stripe_price": STRIPE_PRICE_TEAM},
+    "business":     {"name": "Business",     "analyses": 600,    "price": 799, "seats": 15,     "stripe_price": STRIPE_PRICE_BUSINESS},
+    "enterprise":   {"name": "Enterprise",   "analyses": 999999, "price": 0,   "seats": 999999, "stripe_price": STRIPE_PRICE_ENTERPRISE},
 }
 
 # ── DATABASE ───────────────────────────────────────────────────────────────────
