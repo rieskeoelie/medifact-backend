@@ -860,3 +860,110 @@ def get_tiers():
     """Public endpoint — show available subscription tiers."""
     return [{"id": k, "name": v["name"], "analyses": v["analyses"], "price": v["price"]}
             for k, v in TIERS.items()]
+
+
+# ── ADMIN ──────────────────────────────────────────────────────────────────────
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+
+def verify_admin(x_admin_secret: Annotated[str, Header()] = ""):
+    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def user_to_dict(u: User) -> dict:
+    return {
+        "id":              u.id,
+        "email":           u.email,
+        "name":            u.name,
+        "tier":            u.tier,
+        "tier_name":       TIERS.get(u.tier, {}).get("name", u.tier),
+        "analyses_used":   u.analyses_used,
+        "analyses_limit":  TIERS.get(u.tier, {}).get("analyses", 10),
+        "is_active":       u.is_active,
+        "stripe_sub_id":   u.stripe_sub_id,
+        "created_at":      u.created_at.isoformat() if u.created_at else None,
+    }
+
+class UserPatch(BaseModel):
+    tier:          Optional[str]  = None
+    analyses_used: Optional[int]  = None
+    is_active:     Optional[bool] = None
+
+@app.get("/admin/users")
+async def admin_list_users(
+    registered_hours_ago: Optional[int] = None,
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List all users.
+    ?registered_hours_ago=24  →  only users registered ~24h ago (±1h window)
+    """
+    stmt = select(User).order_by(User.created_at.desc())
+    if registered_hours_ago is not None:
+        window_end   = datetime.now(timezone.utc) - timedelta(hours=registered_hours_ago - 1)
+        window_start = datetime.now(timezone.utc) - timedelta(hours=registered_hours_ago + 1)
+        stmt = stmt.where(User.created_at >= window_start, User.created_at <= window_end)
+    result = await db.execute(stmt)
+    return [user_to_dict(u) for u in result.scalars().all()]
+
+@app.patch("/admin/users/{user_id}")
+async def admin_update_user(
+    user_id: str,
+    patch: UserPatch,
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update tier, analyses_used or is_active for a user."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if patch.tier is not None:
+        if patch.tier not in TIERS:
+            raise HTTPException(status_code=400, detail=f"Unknown tier: {patch.tier}")
+        user.tier = patch.tier
+    if patch.analyses_used is not None:
+        user.analyses_used = max(0, patch.analyses_used)
+    if patch.is_active is not None:
+        user.is_active = patch.is_active
+    await db.commit()
+    await db.refresh(user)
+    return user_to_dict(user)
+
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(
+    user_id: str,
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete a user and all their data."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Also delete analyses
+    await db.execute(text(f"DELETE FROM analyses WHERE user_id = '{user_id}'"))
+    await db.delete(user)
+    await db.commit()
+    return {"ok": True, "deleted": user_id}
+
+@app.get("/admin/stats")
+async def admin_stats(
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate stats for the superadmin dashboard."""
+    users_result = await db.execute(select(User))
+    users = users_result.scalars().all()
+    now = datetime.now(timezone.utc)
+    return {
+        "total_users":      len(users),
+        "active_users":     sum(1 for u in users if u.analyses_used > 0),
+        "paid_users":       sum(1 for u in users if u.tier != "free"),
+        "total_analyses":   sum(u.analyses_used for u in users),
+        "mrr":              sum(TIERS.get(u.tier, {}).get("price", 0) for u in users),
+        "new_today":        sum(1 for u in users if (now - u.created_at).total_seconds() < 86400),
+        "new_week":         sum(1 for u in users if (now - u.created_at).total_seconds() < 604800),
+        "new_month":        sum(1 for u in users if (now - u.created_at).total_seconds() < 2592000),
+        "tier_counts":      {tier: sum(1 for u in users if u.tier == tier) for tier in TIERS},
+    }
