@@ -210,6 +210,12 @@ class AnalyzeRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     tier: str   # starter | professional | enterprise
 
+class SaveAnalysisRequest(BaseModel):
+    query: str
+    score: str
+    gate: str
+    axes_json: Optional[str] = None
+
 class Paper(BaseModel):
     pmid: str = ""; title: str = ""; authors: str = ""
     journal: str = ""; year: str = ""; doi: Optional[str] = None
@@ -1055,6 +1061,34 @@ async def get_share(token: str, db: AsyncSession = Depends(get_db)):
 # ══════════════════════════════════════════════════════════════════════════════
 # ACTIVITY FEED (#17)
 # ══════════════════════════════════════════════════════════════════════════════
+@app.post("/analyses")
+async def save_client_analysis(
+    req: SaveAnalysisRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save a client-side analysis result and increment usage counter."""
+    await check_usage(user, db)
+    analysis = Analysis(
+        user_id=user.id,
+        query=req.query,
+        gate=req.gate,
+        score=req.score,
+        axes_json=req.axes_json,
+        rid="MF-" + uuid.uuid4().hex[:8],
+    )
+    db.add(analysis)
+    await increment_usage(user, db)
+    await db.refresh(user)
+    return {
+        "id": analysis.id,
+        "query": analysis.query,
+        "score": analysis.score,
+        "gate": analysis.gate,
+        "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
+        "analyses_used": user.analyses_used,
+    }
+
 @app.get("/analyses")
 async def get_recent_analyses(
     limit: int = 10,
