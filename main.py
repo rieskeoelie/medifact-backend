@@ -114,6 +114,23 @@ class SharedAnalysis(Base):
     expires_at          = Column(DateTime(timezone=True), nullable=False)
     view_count          = Column(Integer, default=0)
 
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id    = Column(String, nullable=False, index=True)
+    token      = Column(String, unique=True, nullable=False, index=True,
+                        default=lambda: secrets.token_urlsafe(32))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used       = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class EmailTemplate(Base):
+    __tablename__ = "email_templates"
+    key        = Column(String, primary_key=True)   # welcome | reminder | low_credits | password_reset | weekly_digest
+    subject    = Column(String, nullable=False)
+    html_body  = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
 # ── APP SETUP ──────────────────────────────────────────────────────────────────
 app = FastAPI(title="Medifact API", version="3.0.0")
 app.add_middleware(
@@ -121,12 +138,168 @@ app.add_middleware(
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+DEFAULT_EMAIL_TEMPLATES = {
+    "welcome": {
+        "subject": "Welkom bij Medifact — je eerste claim analyseren?",
+        "html_body": """<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/></head>
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;"><tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td style="background:#1E4DA1;border-radius:12px 12px 0 0;padding:28px 36px;text-align:center;">
+  <div style="font-size:22px;font-weight:800;color:#fff;letter-spacing:-.3px;">medifact.eu</div>
+  <div style="font-size:12px;color:#93C5FD;margin-top:4px;letter-spacing:.5px;text-transform:uppercase;">Evidence Intelligence Platform</div>
+</td></tr>
+<tr><td style="background:#ffffff;padding:36px;">
+  <p style="font-size:16px;font-weight:700;color:#0F172A;margin:0 0 8px;">Hallo {{name}},</p>
+  <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 24px;">
+    Je account is aangemaakt. Je hebt <strong style="color:#1E4DA1;">10 gratis analyses</strong> — gebruik ze om te zien wat Medifact voor jouw claims kan doen.
+  </p>
+  <div style="text-align:center;margin-bottom:28px;">
+    <a href="https://medifact.eu/dashboard" style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">
+      Analyseer je eerste claim →
+    </a>
+    <div style="font-size:12px;color:#94A3B8;margin-top:10px;">Geen creditcard nodig · Resultaat binnen 30 seconden</div>
+  </div>
+</td></tr>
+<tr><td style="background:#F8FAFC;border-radius:0 0 12px 12px;padding:20px 36px;border-top:1px solid #E2E8F0;">
+  <p style="font-size:11px;color:#94A3B8;margin:0;">Je ontvangt deze e-mail omdat je een account hebt aangemaakt op <a href="https://medifact.eu" style="color:#1E4DA1;">medifact.eu</a>.</p>
+</td></tr>
+</table></td></tr></table></body></html>""",
+    },
+    "reminder": {
+        "subject": "Je hebt nog {{remaining}} gratis analyses — probeer er één",
+        "html_body": """<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;"><tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td style="background:#1E4DA1;border-radius:12px 12px 0 0;padding:28px 36px;text-align:center;">
+  <div style="font-size:22px;font-weight:800;color:#fff;">medifact.eu</div>
+</td></tr>
+<tr><td style="background:#ffffff;padding:36px;">
+  <p style="font-size:16px;font-weight:700;color:#0F172A;margin:0 0 8px;">Hallo {{name}},</p>
+  <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 20px;">
+    Je hebt je account aangemaakt maar nog weinig analyses gedaan. Je hebt nog <strong style="color:#1E4DA1;">{{remaining}} gratis analyses</strong> die op je wachten.
+  </p>
+  <div style="text-align:center;margin-bottom:20px;">
+    <a href="https://medifact.eu/dashboard" style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">
+      Start je analyse →
+    </a>
+  </div>
+</td></tr>
+<tr><td style="background:#F8FAFC;border-radius:0 0 12px 12px;padding:20px 36px;border-top:1px solid #E2E8F0;">
+  <p style="font-size:11px;color:#94A3B8;margin:0;"><a href="https://medifact.eu" style="color:#1E4DA1;">medifact.eu</a></p>
+</td></tr>
+</table></td></tr></table></body></html>""",
+    },
+    "low_credits": {
+        "subject": "Je hebt nog 2 gratis analyses over — upgrade of gebruik ze nu",
+        "html_body": """<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;"><tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td style="background:#1E4DA1;border-radius:12px 12px 0 0;padding:28px 36px;text-align:center;">
+  <div style="font-size:22px;font-weight:800;color:#fff;">medifact.eu</div>
+  <div style="font-size:12px;color:#93C5FD;margin-top:4px;text-transform:uppercase;">Evidence Intelligence Platform</div>
+</td></tr>
+<tr><td style="background:#ffffff;padding:36px;">
+  <p style="font-size:16px;font-weight:700;color:#0F172A;margin:0 0 8px;">Hallo {{name}},</p>
+  <div style="background:#FFF7ED;border:1.5px solid #FED7AA;border-radius:10px;padding:16px 20px;margin-bottom:20px;">
+    <div style="font-size:14px;font-weight:700;color:#C2410C;margin-bottom:4px;">⚠️ Je hebt nog {{remaining}} gratis analyse(s) over</div>
+    <div style="font-size:13px;color:#92400E;line-height:1.6;">Je hebt {{analyses_used}} van je 10 gratis analyses gebruikt. Daarna heb je een abonnement nodig.</div>
+  </div>
+  <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 24px;">
+    Wil je onbeperkt claims blijven analyseren? Upgrade dan nu naar een betaald abonnement.
+  </p>
+  <div style="text-align:center;margin-bottom:16px;">
+    <a href="https://medifact.eu/dashboard/subscription" style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">
+      Bekijk abonnementen →
+    </a>
+  </div>
+  <div style="text-align:center;">
+    <a href="https://medifact.eu/dashboard" style="font-size:13px;color:#64748B;text-decoration:none;">
+      Of gebruik eerst je resterende analyse(s) →
+    </a>
+  </div>
+</td></tr>
+<tr><td style="background:#F8FAFC;border-radius:0 0 12px 12px;padding:20px 36px;border-top:1px solid #E2E8F0;">
+  <p style="font-size:11px;color:#94A3B8;margin:0;"><a href="https://medifact.eu" style="color:#1E4DA1;">medifact.eu</a> · <a href="mailto:hello@medifact.eu" style="color:#1E4DA1;">Uitschrijven</a></p>
+</td></tr>
+</table></td></tr></table></body></html>""",
+    },
+    "password_reset": {
+        "subject": "Wachtwoord herstellen — Medifact",
+        "html_body": """<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;"><tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td style="background:#1E4DA1;border-radius:12px 12px 0 0;padding:28px 36px;text-align:center;">
+  <div style="font-size:22px;font-weight:800;color:#fff;">medifact.eu</div>
+  <div style="font-size:12px;color:#93C5FD;margin-top:4px;text-transform:uppercase;">Evidence Intelligence Platform</div>
+</td></tr>
+<tr><td style="background:#ffffff;padding:36px;">
+  <p style="font-size:16px;font-weight:700;color:#0F172A;margin:0 0 8px;">Hallo {{name}},</p>
+  <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 24px;">
+    We hebben een verzoek ontvangen om het wachtwoord van je Medifact-account te herstellen. Klik op de knop hieronder om een nieuw wachtwoord in te stellen.
+  </p>
+  <div style="text-align:center;margin-bottom:24px;">
+    <a href="{{reset_link}}" style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">
+      Stel nieuw wachtwoord in →
+    </a>
+    <div style="font-size:12px;color:#94A3B8;margin-top:10px;">Deze link is 1 uur geldig</div>
+  </div>
+  <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:14px 16px;margin-bottom:16px;">
+    <div style="font-size:11px;font-weight:700;color:#94A3B8;text-transform:uppercase;margin-bottom:6px;">Of kopieer deze link:</div>
+    <div style="font-size:12px;color:#475569;word-break:break-all;">{{reset_link}}</div>
+  </div>
+  <p style="font-size:13px;color:#94A3B8;margin:0;">Als jij dit verzoek niet hebt gedaan, kun je deze e-mail veilig negeren. Je wachtwoord blijft ongewijzigd.</p>
+</td></tr>
+<tr><td style="background:#F8FAFC;border-radius:0 0 12px 12px;padding:20px 36px;border-top:1px solid #E2E8F0;">
+  <p style="font-size:11px;color:#94A3B8;margin:0;"><a href="https://medifact.eu" style="color:#1E4DA1;">medifact.eu</a> · <a href="mailto:hello@medifact.eu" style="color:#1E4DA1;">Support</a></p>
+</td></tr>
+</table></td></tr></table></body></html>""",
+    },
+    "weekly_digest": {
+        "subject": "📊 Jouw wekelijkse Medifact digest",
+        "html_body": """<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;"><tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td style="background:#1E4DA1;border-radius:12px 12px 0 0;padding:28px 36px;text-align:center;">
+  <div style="font-size:22px;font-weight:800;color:#fff;">medifact.eu</div>
+  <div style="font-size:12px;color:#93C5FD;margin-top:4px;text-transform:uppercase;">Wekelijkse Digest</div>
+</td></tr>
+<tr><td style="background:#ffffff;padding:36px;">
+  <p style="font-size:16px;font-weight:700;color:#0F172A;margin:0 0 8px;">Hallo {{name}},</p>
+  <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 20px;">
+    Je hebt deze week <strong style="color:#1E4DA1;">{{analyses_used}} van {{limit}}</strong> analyses gebruikt.
+  </p>
+  <div style="text-align:center;margin-bottom:20px;">
+    <a href="https://medifact.eu/dashboard" style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">
+      Naar dashboard →
+    </a>
+  </div>
+</td></tr>
+<tr><td style="background:#F8FAFC;border-radius:0 0 12px 12px;padding:20px 36px;border-top:1px solid #E2E8F0;">
+  <p style="font-size:11px;color:#94A3B8;margin:0;"><a href="https://medifact.eu" style="color:#1E4DA1;">medifact.eu</a> · <a href="mailto:hello@medifact.eu" style="color:#1E4DA1;">Uitschrijven</a></p>
+</td></tr>
+</table></td></tr></table></body></html>""",
+    },
+}
+
 @app.on_event("startup")
 async def startup():
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         print("✅ Database tables created/verified")
+        # Seed default email templates (skip if already exist)
+        async with AsyncSessionLocal() as session:
+            for key, tpl in DEFAULT_EMAIL_TEMPLATES.items():
+                existing = await session.execute(select(EmailTemplate).where(EmailTemplate.key == key))
+                if not existing.scalar_one_or_none():
+                    session.add(EmailTemplate(key=key, subject=tpl["subject"], html_body=tpl["html_body"]))
+            await session.commit()
+        print("✅ Email templates seeded")
     except Exception as e:
         print(f"❌ DB startup error: {e}")
 
@@ -196,11 +369,41 @@ async def check_usage(user: User, db: AsyncSession):
             detail=f"Maandlimiet bereikt ({limit} analyses voor {TIERS[user.tier]['name']}). Upgrade je abonnement."
         )
 
+async def _get_template(db: AsyncSession, key: str) -> tuple[str, str]:
+    """Return (subject, html_body) from DB, falling back to DEFAULT_EMAIL_TEMPLATES."""
+    result = await db.execute(select(EmailTemplate).where(EmailTemplate.key == key))
+    tpl = result.scalar_one_or_none()
+    if tpl:
+        return tpl.subject, tpl.html_body
+    fallback = DEFAULT_EMAIL_TEMPLATES.get(key, {"subject": key, "html_body": "<p>{{name}}</p>"})
+    return fallback["subject"], fallback["html_body"]
+
+def _render_template(html: str, variables: dict) -> str:
+    """Replace {{var}} placeholders in template HTML."""
+    for k, v in variables.items():
+        html = html.replace(f"{{{{{k}}}}}", str(v))
+    return html
+
+async def _send_templated_email(db: AsyncSession, key: str, to: str, variables: dict) -> tuple[bool, str]:
+    """Fetch template, render variables, send via Resend."""
+    subject_tpl, html_tpl = await _get_template(db, key)
+    subject = _render_template(subject_tpl, variables)
+    html = _render_template(html_tpl, variables)
+    return await _send_resend_email(to, subject, html)
+
 async def increment_usage(user: User, db: AsyncSession):
+    new_count = user.analyses_used + 1
     await db.execute(
-        update(User).where(User.id == user.id).values(analyses_used=User.analyses_used + 1)
+        update(User).where(User.id == user.id).values(analyses_used=new_count)
     )
     await db.commit()
+    # Low-credits warning: send when free user hits 8 out of 10
+    if user.tier == "free" and new_count == 8:
+        remaining = 10 - new_count
+        asyncio.create_task(_send_templated_email(
+            db=db, key="low_credits", to=user.email,
+            variables={"name": user.name.split()[0], "remaining": remaining, "analyses_used": new_count},
+        ))
 
 # ── PYDANTIC SCHEMAS ───────────────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
@@ -228,6 +431,17 @@ class SaveAnalysisRequest(BaseModel):
     score: str
     gate: str
     axes_json: Optional[str] = None
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str
+
+class EmailTemplatePatch(BaseModel):
+    subject: Optional[str] = None
+    html_body: Optional[str] = None
 
 class Paper(BaseModel):
     pmid: str = ""; title: str = ""; authors: str = ""
@@ -657,6 +871,61 @@ async def me(current_user: User = Depends(get_current_user)):
         "analyses_used": current_user.analyses_used, "analyses_limit": tier_info["analyses"],
         "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
     }
+
+@app.post("/auth/forgot-password")
+async def forgot_password(req: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """Generate reset token and send email. Always returns 200 to prevent email enumeration."""
+    result = await db.execute(select(User).where(User.email == req.email.lower().strip()))
+    user = result.scalar_one_or_none()
+    if user and user.is_active:
+        # Expire old tokens
+        await db.execute(
+            update(PasswordResetToken)
+            .where(PasswordResetToken.user_id == user.id, PasswordResetToken.used == False)
+            .values(used=True)
+        )
+        reset_token = PasswordResetToken(
+            user_id=user.id,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        db.add(reset_token)
+        await db.commit()
+        await db.refresh(reset_token)
+        reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token.token}"
+        asyncio.create_task(_send_templated_email(
+            db=db, key="password_reset", to=user.email,
+            variables={"name": user.name.split()[0], "reset_link": reset_link},
+        ))
+    return {"ok": True, "message": "Als dit e-mailadres bekend is, ontvang je een herstelmail."}
+
+@app.post("/auth/reset-password")
+async def reset_password(req: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """Validate token and set new password."""
+    if len(req.password) < 8:
+        raise HTTPException(status_code=400, detail="Wachtwoord moet minimaal 8 tekens zijn")
+    result = await db.execute(
+        select(PasswordResetToken).where(
+            PasswordResetToken.token == req.token,
+            PasswordResetToken.used == False,
+        )
+    )
+    token_obj = result.scalar_one_or_none()
+    if not token_obj:
+        raise HTTPException(status_code=400, detail="Ongeldige of verlopen hersteltoken")
+    now = datetime.now(timezone.utc)
+    expires = token_obj.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if now > expires:
+        raise HTTPException(status_code=400, detail="Hersteltoken is verlopen. Vraag een nieuwe aan.")
+    await db.execute(
+        update(User).where(User.id == token_obj.user_id).values(password_hash=hash_password(req.password))
+    )
+    await db.execute(
+        update(PasswordResetToken).where(PasswordResetToken.id == token_obj.id).values(used=True)
+    )
+    await db.commit()
+    return {"ok": True, "message": "Wachtwoord succesvol gewijzigd."}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BILLING ENDPOINTS (STRIPE)
@@ -1345,3 +1614,102 @@ async def test_email(
         "resend_api_key_set": bool(RESEND_API_KEY),
         "from_email": FROM_EMAIL,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN — EMAIL TEMPLATES
+# ══════════════════════════════════════════════════════════════════════════════
+TEMPLATE_META = {
+    "welcome":        {"label": "Welkomstmail",       "vars": ["name"]},
+    "reminder":       {"label": "Herinnering (24u)",  "vars": ["name", "remaining", "analyses_used"]},
+    "low_credits":    {"label": "Bijna door credits", "vars": ["name", "remaining", "analyses_used"]},
+    "password_reset": {"label": "Wachtwoord reset",   "vars": ["name", "reset_link"]},
+    "weekly_digest":  {"label": "Wekelijkse digest",  "vars": ["name", "analyses_used", "limit"]},
+}
+
+@app.get("/admin/email-templates")
+async def admin_get_templates(
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(EmailTemplate).order_by(EmailTemplate.key))
+    templates = result.scalars().all()
+    out = []
+    for t in templates:
+        meta = TEMPLATE_META.get(t.key, {})
+        out.append({
+            "key": t.key,
+            "label": meta.get("label", t.key),
+            "subject": t.subject,
+            "html_body": t.html_body,
+            "variables": meta.get("vars", []),
+            "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        })
+    return out
+
+@app.put("/admin/email-templates/{key}")
+async def admin_update_template(
+    key: str,
+    patch: EmailTemplatePatch,
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(EmailTemplate).where(EmailTemplate.key == key))
+    tpl = result.scalar_one_or_none()
+    if not tpl:
+        raise HTTPException(status_code=404, detail=f"Template '{key}' niet gevonden")
+    if patch.subject is not None:
+        tpl.subject = patch.subject
+    if patch.html_body is not None:
+        tpl.html_body = patch.html_body
+    tpl.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(tpl)
+    return {"ok": True, "key": tpl.key, "subject": tpl.subject}
+
+@app.post("/admin/email-templates/test/{key}")
+async def admin_test_template(
+    key: str,
+    request: Request,
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a test email for the given template to the provided email address."""
+    body = await request.json()
+    to = body.get("to", "")
+    if not to:
+        raise HTTPException(status_code=400, detail="'to' field is vereist")
+    test_vars = {
+        "name": "Test Gebruiker",
+        "remaining": 2,
+        "analyses_used": 8,
+        "reset_link": f"{FRONTEND_URL}/reset-password?token=TEST_TOKEN_EXAMPLE",
+        "limit": 10,
+    }
+    ok, err = await _send_templated_email(db=db, key=key, to=to, variables=test_vars)
+    return {"ok": ok, "error": err, "template": key, "to": to}
+
+@app.post("/admin/email-templates/test-all")
+async def admin_test_all_templates(
+    request: Request,
+    _: str = Depends(verify_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send test emails for ALL templates to the provided address."""
+    body = await request.json()
+    to = body.get("to", "")
+    if not to:
+        raise HTTPException(status_code=400, detail="'to' field is vereist")
+    results = {}
+    for key in DEFAULT_EMAIL_TEMPLATES.keys():
+        test_vars = {
+            "name": "Test Gebruiker",
+            "remaining": 2,
+            "analyses_used": 8,
+            "reset_link": f"{FRONTEND_URL}/reset-password?token=TEST_TOKEN_EXAMPLE",
+            "limit": 10,
+        }
+        ok, err = await _send_templated_email(db=db, key=key, to=to, variables=test_vars)
+        results[key] = {"ok": ok, "error": err}
+        await asyncio.sleep(0.3)   # slight delay to avoid Resend rate limit
+    return {"results": results, "to": to}
