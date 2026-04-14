@@ -11,7 +11,7 @@ from typing import Optional, Annotated
 import httpx
 import stripe
 from anthropic import AsyncAnthropic
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import bcrypt as _bcrypt
@@ -369,26 +369,40 @@ async def check_usage(user: User, db: AsyncSession):
             detail=f"Maandlimiet bereikt ({limit} analyses voor {TIERS[user.tier]['name']}). Upgrade je abonnement."
         )
 
-async def _get_template(db: AsyncSession, key: str) -> tuple[str, str]:
-    """Return (subject, html_body) from DB, falling back to DEFAULT_EMAIL_TEMPLATES."""
-    result = await db.execute(select(EmailTemplate).where(EmailTemplate.key == key))
-    tpl = result.scalar_one_or_none()
-    if tpl:
-        return tpl.subject, tpl.html_body
-    fallback = DEFAULT_EMAIL_TEMPLATES.get(key, {"subject": key, "html_body": "<p>{{name}}</p>"})
-    return fallback["subject"], fallback["html_body"]
-
 def _render_template(html: str, variables: dict) -> str:
     """Replace {{var}} placeholders in template HTML."""
     for k, v in variables.items():
         html = html.replace(f"{{{{{k}}}}}", str(v))
     return html
 
+async def _send_email_bg(key: str, to: str, variables: dict) -> None:
+    """Background-safe email sender: opens its own DB session so it works after request ends."""
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(EmailTemplate).where(EmailTemplate.key == key))
+            tpl = result.scalar_one_or_none()
+            if tpl:
+                subject_tpl, html_tpl = tpl.subject, tpl.html_body
+            else:
+                fallback = DEFAULT_EMAIL_TEMPLATES.get(key, {"subject": key, "html_body": "<p>{{name}}</p>"})
+                subject_tpl, html_tpl = fallback["subject"], fallback["html_body"]
+        subject = _render_template(subject_tpl, variables)
+        html    = _render_template(html_tpl, variables)
+        await _send_resend_email(to, subject, html)
+    except Exception as e:
+        print(f"[Email BG] Failed to send '{key}' to {to}: {e}")
+
 async def _send_templated_email(db: AsyncSession, key: str, to: str, variables: dict) -> tuple[bool, str]:
-    """Fetch template, render variables, send via Resend."""
-    subject_tpl, html_tpl = await _get_template(db, key)
+    """Inline (in-request) send: uses the provided session. For admin test endpoints."""
+    result = await db.execute(select(EmailTemplate).where(EmailTemplate.key == key))
+    tpl = result.scalar_one_or_none()
+    if tpl:
+        subject_tpl, html_tpl = tpl.subject, tpl.html_body
+    else:
+        fallback = DEFAULT_EMAIL_TEMPLATES.get(key, {"subject": key, "html_body": "<p>{{name}}</p>"})
+        subject_tpl, html_tpl = fallback["subject"], fallback["html_body"]
     subject = _render_template(subject_tpl, variables)
-    html = _render_template(html_tpl, variables)
+    html    = _render_template(html_tpl, variables)
     return await _send_resend_email(to, subject, html)
 
 async def increment_usage(user: User, db: AsyncSession):
@@ -400,8 +414,8 @@ async def increment_usage(user: User, db: AsyncSession):
     # Low-credits warning: send when free user hits 8 out of 10
     if user.tier == "free" and new_count == 8:
         remaining = 10 - new_count
-        asyncio.create_task(_send_templated_email(
-            db=db, key="low_credits", to=user.email,
+        asyncio.create_task(_send_email_bg(
+            key="low_credits", to=user.email,
             variables={"name": user.name.split()[0], "remaining": remaining, "analyses_used": new_count},
         ))
 
@@ -817,7 +831,7 @@ def meta_check(results: list[AxisResult]) -> tuple[str, str]:
 # AUTH ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/auth/register")
-async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(req: RegisterRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     try:
         result = await db.execute(select(User).where(User.email == req.email.lower()))
         if result.scalar_one_or_none():
@@ -833,6 +847,13 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
         await db.refresh(user)
         token = create_token(user.id, user.email)
         tier_info = TIERS["free"]
+        # Send welcome email in background
+        background_tasks.add_task(
+            _send_email_bg,
+            key="welcome",
+            to=user.email,
+            variables={"name": user.name.split()[0]},
+        )
         return {
             "token": token,
             "user": {"id": user.id, "email": user.email, "name": user.name,
@@ -873,7 +894,11 @@ async def me(current_user: User = Depends(get_current_user)):
     }
 
 @app.post("/auth/forgot-password")
-async def forgot_password(req: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+async def forgot_password(
+    req: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """Generate reset token and send email. Always returns 200 to prevent email enumeration."""
     result = await db.execute(select(User).where(User.email == req.email.lower().strip()))
     user = result.scalar_one_or_none()
@@ -892,10 +917,12 @@ async def forgot_password(req: ForgotPasswordRequest, db: AsyncSession = Depends
         await db.commit()
         await db.refresh(reset_token)
         reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token.token}"
-        asyncio.create_task(_send_templated_email(
-            db=db, key="password_reset", to=user.email,
+        background_tasks.add_task(
+            _send_email_bg,
+            key="password_reset",
+            to=user.email,
             variables={"name": user.name.split()[0], "reset_link": reset_link},
-        ))
+        )
     return {"ok": True, "message": "Als dit e-mailadres bekend is, ontvang je een herstelmail."}
 
 @app.post("/auth/reset-password")
