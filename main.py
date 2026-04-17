@@ -46,13 +46,17 @@ STRIPE_PRICE_TEAM           = os.environ.get("STRIPE_PRICE_TEAM", "")
 STRIPE_PRICE_BUSINESS       = os.environ.get("STRIPE_PRICE_BUSINESS", "")
 
 # ── SUBSCRIPTION TIERS ────────────────────────────────────────────────────────
+# Canonical tiers (April 2026): free / pro / team / enterprise
+# Legacy tiers (solo / professional / business) blijven voor grandfathered bestaande klanten
 TIERS = {
-    "free":         {"name": "Gratis",       "analyses": 10,     "price": 0,   "seats": 1,      "stripe_price": None},
+    "free":         {"name": "Gratis",       "analyses": 5,      "price": 0,   "seats": 1,      "stripe_price": None},
+    "pro":          {"name": "Pro",          "analyses": 50,     "price": 99,  "seats": 1,      "stripe_price": None},
+    "team":         {"name": "Team",         "analyses": 300,    "price": 349, "seats": 10,     "stripe_price": None},
+    "enterprise":   {"name": "Enterprise",   "analyses": 999999, "price": 1500,"seats": 999999, "stripe_price": None},
+    # ── Legacy — grandfathered bestaande klanten (niet zichtbaar op pricing page) ──
     "solo":         {"name": "Solo",         "analyses": 30,     "price": 79,  "seats": 1,      "stripe_price": STRIPE_PRICE_SOLO},
     "professional": {"name": "Professional", "analyses": 100,    "price": 199, "seats": 1,      "stripe_price": STRIPE_PRICE_PROFESSIONAL},
-    "team":         {"name": "Team",         "analyses": 200,    "price": 399, "seats": 5,      "stripe_price": STRIPE_PRICE_TEAM},
     "business":     {"name": "Business",     "analyses": 600,    "price": 799, "seats": 15,     "stripe_price": STRIPE_PRICE_BUSINESS},
-    "enterprise":   {"name": "Enterprise",   "analyses": 999999, "price": 0,   "seats": 999999, "stripe_price": STRIPE_PRICE_ENTERPRISE},
 }
 
 # ── DATABASE ───────────────────────────────────────────────────────────────────
