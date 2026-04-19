@@ -513,17 +513,17 @@ async def _process_next_job() -> None:
         passed_count = len(passed)
         total        = len(results)
 
-        # Verdict copy + colours — matches frontend logic (8=bewezen, 5-7=matig, 0-4=afgewezen)
+        # Verdict copy + colours — consistent met site: Bewezen / Deels onderbouwd / Afgewezen
         if is_open:
-            verdict_nl     = "Wetenschappelijk ondersteund"
+            verdict_nl     = "Bewezen"
             verdict_bg     = "#F0FDF4"; verdict_border = "#BBF7D0"
             verdict_color  = "#15803D"; verdict_sub    = "#166534"
         elif passed_count >= 5:
-            verdict_nl     = "Beperkte wetenschappelijke ondersteuning"
+            verdict_nl     = "Deels onderbouwd"
             verdict_bg     = "#FFFBEB"; verdict_border = "#FDE68A"
             verdict_color  = "#B45309"; verdict_sub    = "#92400E"
         else:
-            verdict_nl     = "Niet wetenschappelijk ondersteund"
+            verdict_nl     = "Afgewezen"
             verdict_bg     = "#FEF2F2"; verdict_border = "#FECACA"
             verdict_color  = "#DC2626"; verdict_sub    = "#991B1B"
 
@@ -591,7 +591,7 @@ async def _process_next_job() -> None:
 </table>
 </body>
 </html>"""
-        await _send_resend_email(user_email, f"Medifact analyse klaar: {verdict_nl}", html)
+        await _send_resend_email(user_email, f"Je Medifact analyse is klaar — {verdict_nl}", html)
         print(f"[Worker] Job {job_id} done — emailed {user_email}")
 
     except Exception as e:
