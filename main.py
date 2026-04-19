@@ -461,7 +461,9 @@ async def _process_next_job() -> None:
             pr = PROFILE
             axis_fns = [run_a1, run_a2, run_a3, run_a4, run_a5, run_a6, run_a7, run_a8]
             results = list(await asyncio.gather(*[fn(query, pr) for fn in axis_fns]))
-            await _cache_set(cache_key, [r.dict() for r in results])
+            # Only cache if at least one criterion has real data (guard against 0-result poisoning)
+            if any(r.score not in ('—', '-', '0', '') for r in results):
+                await _cache_set(cache_key, [r.dict() for r in results])
 
         failed = [r for r in results if r.status == "fail"]
         passed = [r for r in results if r.status == "pass"]
@@ -1961,6 +1963,18 @@ async def admin_delete_user(
     await db.delete(user)
     await db.commit()
     return {"ok": True, "deleted": user_id}
+
+@app.delete("/admin/cache")
+@limiter.limit("20/minute")
+async def admin_delete_cache(request: Request, query: str, _: str = Depends(verify_admin)):
+    """Delete a cached analysis result by query string so it re-runs fresh."""
+    key = "medifact:axes:" + hashlib.sha256(query.lower().strip().encode()).hexdigest()[:32]
+    r = await _get_redis()
+    if r:
+        await r.delete(key)
+        return {"deleted": key}
+    return {"error": "Redis niet beschikbaar"}
+
 
 @app.get("/admin/stats")
 @limiter.limit("30/minute")
