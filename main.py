@@ -4,11 +4,12 @@ Medifact — SaaS API v3.0
 Multi-user · Stripe subscriptions · PostgreSQL · 8-axis scientific gate
 """
 
-import asyncio, hashlib, json, os, re, secrets, uuid
+import asyncio, hashlib, itertools, json, os, re, secrets, uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Annotated
 
 import httpx
+import redis.asyncio as aioredis
 import stripe
 from anthropic import AsyncAnthropic
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks
@@ -42,6 +43,13 @@ MODEL             = os.environ.get("MEDIFACT_MODEL", "claude-haiku-4-5-20251001"
 NCBI              = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CT_V2             = "https://clinicaltrials.gov/api/v2/studies"
 NCBI_API_KEY      = os.environ.get("NCBI_API_KEY", "")   # Register at: https://www.ncbi.nlm.nih.gov/account/
+REDIS_URL         = os.environ.get("REDIS_URL", "")
+ANALYSIS_CACHE_TTL = int(os.environ.get("ANALYSIS_CACHE_TTL", "86400"))  # 24h default
+
+# NCBI key pool — add NCBI_API_KEY_2, NCBI_API_KEY_3 etc. for higher throughput
+_ncbi_key_pool = [k for name in ["NCBI_API_KEY", "NCBI_API_KEY_2", "NCBI_API_KEY_3"]
+                  if (k := os.environ.get(name, ""))]
+_ncbi_key_cycle = itertools.cycle(_ncbi_key_pool) if _ncbi_key_pool else None
 
 stripe.api_key              = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET       = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -166,7 +174,7 @@ def _real_ip(request: Request) -> str:
         return xff.split(",")[0].strip()
     return request.client.host if request.client else "127.0.0.1"
 
-limiter = Limiter(key_func=_real_ip)
+limiter = Limiter(key_func=_real_ip, storage_uri=REDIS_URL if REDIS_URL else "memory://")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
@@ -180,8 +188,39 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 # Shared HTTP client — avoids TCP handshake per call
 _http = httpx.AsyncClient(timeout=15)
-# Max 8 concurrent NCBI requests regardless of how many analyses run simultaneously
-_ncbi_sem = asyncio.Semaphore(8)
+# Max 4 concurrent NCBI requests — tuned to NCBI's 10 req/s limit (~400ms avg call = 4×2.5/s ≈ 10/s)
+_ncbi_sem = asyncio.Semaphore(4)
+# Max 5 concurrent Claude calls — prevents Anthropic TPM bursts under heavy load
+_claude_sem = asyncio.Semaphore(5)
+# Lazy Redis client — initialised on first use
+_redis: aioredis.Redis | None = None
+
+async def _get_redis() -> aioredis.Redis | None:
+    global _redis
+    if not REDIS_URL:
+        return None
+    if _redis is None:
+        _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    return _redis
+
+async def _cache_get(key: str) -> list | None:
+    r = await _get_redis()
+    if not r:
+        return None
+    try:
+        data = await r.get(key)
+        return json.loads(data) if data else None
+    except Exception:
+        return None
+
+async def _cache_set(key: str, value: list, ttl: int = ANALYSIS_CACHE_TTL) -> None:
+    r = await _get_redis()
+    if not r:
+        return
+    try:
+        await r.setex(key, ttl, json.dumps(value))
+    except Exception:
+        pass
 DEFAULT_EMAIL_TEMPLATES = {
     "welcome": {
         "subject": "Welkom bij Medifact — je eerste claim analyseren?",
@@ -581,10 +620,10 @@ PROFILE = {"v": 15, "r": 70, "c": 15, "s": 2, "q": 8, "i": 5, "a": 90, "p": 2,
 
 # ── PUBMED + CT HELPERS ────────────────────────────────────────────────────────
 async def _ncbi_get(url: str, params: dict) -> httpx.Response:
-    """Semaphore-gated NCBI request with exponential backoff on 429."""
-    if NCBI_API_KEY:
-        params = {**params, "api_key": NCBI_API_KEY}
-    for attempt in range(3):
+    """Semaphore-gated NCBI request with key rotation and exponential backoff on 429."""
+    if _ncbi_key_cycle:
+        params = {**params, "api_key": next(_ncbi_key_cycle)}
+    for attempt in range(4):
         async with _ncbi_sem:
             r = await _http.get(url, params=params, timeout=15)
         if r.status_code != 429:
@@ -665,10 +704,11 @@ def format_abstracts(papers: list[dict], max_chars: int = 400) -> str:
 
 async def call_claude(system: str, user: str, max_tokens: int = 900) -> dict:
     try:
-        response = await claude.messages.create(
-            model=MODEL, max_tokens=max_tokens, system=system,
-            messages=[{"role": "user", "content": user}]
-        )
+        async with _claude_sem:
+            response = await claude.messages.create(
+                model=MODEL, max_tokens=max_tokens, system=system,
+                messages=[{"role": "user", "content": user}]
+            )
         text = response.content[0].text.strip()
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
@@ -1278,8 +1318,15 @@ async def analyze(request: Request, req: AnalyzeRequest,
     await check_usage(current_user, db)
 
     pr = PROFILE
-    axis_fns = [run_a1, run_a2, run_a3, run_a4, run_a5, run_a6, run_a7, run_a8]
-    results = await asyncio.gather(*[fn(req.query, pr) for fn in axis_fns], return_exceptions=False)
+    cache_key = "medifact:axes:" + hashlib.sha256(req.query.lower().strip().encode()).hexdigest()[:32]
+    cached_axes = await _cache_get(cache_key)
+
+    if cached_axes:
+        results = [AxisResult(**r) for r in cached_axes]
+    else:
+        axis_fns = [run_a1, run_a2, run_a3, run_a4, run_a5, run_a6, run_a7, run_a8]
+        results = await asyncio.gather(*[fn(req.query, pr) for fn in axis_fns], return_exceptions=False)
+        await _cache_set(cache_key, [r.dict() for r in results])
 
     failed  = [r for r in results if r.status == "fail"]
     passed  = [r for r in results if r.status == "pass"]
@@ -1309,6 +1356,7 @@ async def analyze(request: Request, req: AnalyzeRequest,
         "meta": {"status": meta_s, "detail": meta_d},
         "rid": rid, "timestamp": ts, "sha256": sha,
         "regulatory": pr.get("reg", []),
+        "cached": cached_axes is not None,
     }
 
 @app.get("/api/analyze/stream")
@@ -1326,28 +1374,11 @@ async def analyze_stream(request: Request, query: str, profile: str = "medical",
     await check_usage(current_user, db)
 
     pr = PROFILE
-    axis_fns = [run_a1, run_a2, run_a3, run_a4, run_a5, run_a6, run_a7, run_a8]
-    queue: asyncio.Queue = asyncio.Queue()
+    cache_key = "medifact:axes:" + hashlib.sha256(query.lower().strip().encode()).hexdigest()[:32]
+    cached_axes = await _cache_get(cache_key)
 
-    async def run_one(fn, idx):
-        try:
-            res = await fn(query, pr)
-            d = res.dict(); d["axis_index"] = idx; d["type"] = "axis_result"
-        except Exception as e:
-            d = {"type": "axis_result", "axis_index": idx, "axis": f"A{idx+1}",
-                 "status": "fail", "score": "err", "finding": str(e), "live": False}
-        await queue.put(d)
-
-    async def event_stream():
-        tasks = [asyncio.create_task(run_one(fn, i)) for i, fn in enumerate(axis_fns)]
-        completed = []
-        for _ in range(8):
-            item = await queue.get()
-            completed.append(item)
-            yield f"data: {json.dumps(item)}\n\n"
-
-        results = [AxisResult(**{k: v for k, v in c.items() if k not in ("axis_index","type")})
-                   for c in sorted(completed, key=lambda x: x["axis_index"]) if "status" in c]
+    async def _finish_and_stream(results: list[AxisResult], from_cache: bool):
+        """Common tail: compute verdict, save to DB, yield done event."""
         failed  = [r for r in results if r.status == "fail"]
         passed  = [r for r in results if r.status == "pass"]
         meta_s, meta_d = meta_check(results)
@@ -1357,7 +1388,6 @@ async def analyze_stream(request: Request, query: str, profile: str = "medical",
         payload_str = json.dumps({"query": query, "results": [r.dict() for r in results], "rid": rid}, sort_keys=True)
         sha = hashlib.sha256(payload_str.encode()).hexdigest()[:32]
 
-        # Save + count
         analysis = Analysis(
             user_id=current_user.id, query=query,
             gate="open" if is_open else "closed",
@@ -1373,13 +1403,51 @@ async def analyze_stream(request: Request, query: str, profile: str = "medical",
         summary = {"type": "done", "gate": "open" if is_open else "closed",
                    "score": f"{len(passed)}/{len(results)}", "rid": rid, "timestamp": ts,
                    "sha256": sha, "meta": {"status": meta_s, "detail": meta_d},
-                   "regulatory": pr.get("reg", []), "profile_label": "Medical"}
+                   "regulatory": pr.get("reg", []), "profile_label": "Medical",
+                   "cached": from_cache}
         yield f"data: {json.dumps(summary)}\n\n"
+
+    async def event_stream_cached(axes: list[dict]):
+        """Stream cached axis results instantly, then finish."""
+        for i, ax in enumerate(axes):
+            d = {**ax, "axis_index": i, "type": "axis_result"}
+            yield f"data: {json.dumps(d)}\n\n"
+        results = [AxisResult(**ax) for ax in axes]
+        async for chunk in _finish_and_stream(results, from_cache=True):
+            yield chunk
+
+    async def event_stream_live():
+        """Run all 8 axes concurrently, stream results as they complete."""
+        axis_fns = [run_a1, run_a2, run_a3, run_a4, run_a5, run_a6, run_a7, run_a8]
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def run_one(fn, idx):
+            try:
+                res = await fn(query, pr)
+                d = res.dict(); d["axis_index"] = idx; d["type"] = "axis_result"
+            except Exception as e:
+                d = {"type": "axis_result", "axis_index": idx, "axis": f"A{idx+1}",
+                     "status": "fail", "score": "err", "finding": str(e), "live": False}
+            await queue.put(d)
+
+        tasks = [asyncio.create_task(run_one(fn, i)) for i, fn in enumerate(axis_fns)]
+        completed = []
+        for _ in range(8):
+            item = await queue.get()
+            completed.append(item)
+            yield f"data: {json.dumps(item)}\n\n"
+
+        results = [AxisResult(**{k: v for k, v in c.items() if k not in ("axis_index","type")})
+                   for c in sorted(completed, key=lambda x: x["axis_index"]) if "status" in c]
+        await _cache_set(cache_key, [r.dict() for r in results])
+        async for chunk in _finish_and_stream(results, from_cache=False):
+            yield chunk
         for t in tasks:
             if not t.done(): t.cancel()
 
+    generator = event_stream_cached(cached_axes) if cached_axes else event_stream_live()
     return StreamingResponse(
-        event_stream(), media_type="text/event-stream",
+        generator, media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
 

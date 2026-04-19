@@ -24,3 +24,6 @@ stripe>=11.0.0
 
 # Rate limiting
 slowapi>=0.1.9
+
+# Cache & distributed state
+redis[asyncio]>=5.0.0
