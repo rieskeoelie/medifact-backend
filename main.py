@@ -513,6 +513,22 @@ async def _process_next_job() -> None:
         passed_count = len(passed)
         total        = len(results)
 
+        # Build per-criterion rows for email
+        _chip_map = {
+            'pass':   ('Geslaagd',    '#ecfdf5', '#065f46', '#a7f3d0'),
+            'border': ('Borderline',  '#fffbeb', '#92400e', '#fde68a'),
+            'fail':   ('Geblokkeerd', '#fef2f2', '#991b1b', '#fecaca'),
+        }
+        _axis_names = {'A1':'Volume','A2':'Recency','A3':'Consensus','A4':'Standaarden','A5':'Kwantitatief','A6':'Onafhankelijkheid','A7':'Toepasbaarheid','A8':'Verifieerbaarheid'}
+        criteria_rows_html = ""
+        for r in results:
+            lbl, bg, col, brd = _chip_map.get(r.status, _chip_map['fail'])
+            finding_short = (r.finding[:110] + '…') if len(r.finding) > 110 else r.finding
+            ax_name = _axis_names.get(r.axis, r.axis)
+            is_last_row = r == results[-1]
+            border_style = "" if is_last_row else "border-bottom:1px solid #F1F5F9;"
+            criteria_rows_html += f"""<tr><td style="padding:10px 0;{border_style}"><table width="100%" cellpadding="0" cellspacing="0"><tr><td style="font-size:12px;color:#374151;font-weight:700;">{r.axis} · {ax_name}</td><td align="right" style="white-space:nowrap;"><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:{bg};color:{col};border:1px solid {brd};">{lbl}</span>&nbsp;<span style="font-size:12px;font-weight:700;color:#374151;">{r.score}</span></td></tr><tr><td colspan="2" style="font-size:11px;color:#64748b;padding-top:3px;line-height:1.4;">{finding_short}</td></tr></table></td></tr>"""
+
         # Verdict copy + colours — consistent met site: Bewezen / Deels onderbouwd / Afgewezen
         if is_open:
             verdict_nl     = "Bewezen"
@@ -562,6 +578,14 @@ async def _process_next_job() -> None:
       <div style="font-size:11px;font-weight:600;color:{verdict_sub};text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px;">Uitkomst</div>
       <div style="font-size:20px;font-weight:800;color:{verdict_color};margin-bottom:4px;">{verdict_nl}</div>
       <div style="font-size:13px;color:{verdict_sub};">{passed_count} van {total} wetenschappelijke criteria geslaagd</div>
+    </div>
+
+    <!-- Criteria -->
+    <div style="margin-bottom:28px;">
+      <div style="font-size:11px;font-weight:600;color:#94A3B8;text-transform:uppercase;letter-spacing:0.6px;margin-bottom:10px;">Resultaten per criterium</div>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #E2E8F0;border-radius:12px;overflow:hidden;background:#fff;">
+        {criteria_rows_html}
+      </table>
     </div>
 
     <!-- CTA -->
