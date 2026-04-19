@@ -265,10 +265,15 @@ async def _slot_acquire(slot_id: str) -> bool:
     max_slots = int(os.environ.get("MAX_CONCURRENT_ANALYSES", "3"))
     now = time.time()
     try:
-        result = await r.eval(_SLOT_ACQUIRE_LUA, 1, _SLOT_KEY,
-                              str(max_slots), slot_id, str(now + _SLOT_TTL), str(now))
-        return bool(result)
-    except Exception:
+        # Clean expired slots, count active, add new slot if room
+        await r.zremrangebyscore(_SLOT_KEY, "-inf", now)
+        count = await r.zcard(_SLOT_KEY)
+        if count >= max_slots:
+            return False
+        await r.zadd(_SLOT_KEY, {slot_id: now + _SLOT_TTL})
+        return True
+    except Exception as e:
+        print(f"[Slot] Redis error in acquire: {e}", flush=True)
         return True  # fail-open on Redis error
 
 async def _slot_release(slot_id: str) -> None:
