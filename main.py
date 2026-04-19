@@ -497,34 +497,89 @@ async def _process_next_job() -> None:
             ))
             await db.commit()
 
-        first_name = user_name.split()[0] if user_name else "daar"
-        verdict_nl = "Ondersteund" if is_open else "Niet ondersteund"
-        score_str  = f"{len(passed)}/{len(results)}"
-        html = f"""<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8"/></head>
+        first_name  = user_name.split()[0] if user_name else "daar"
+        passed_count = len(passed)
+        total        = len(results)
+
+        # Verdict copy + colours — matches frontend logic (8=bewezen, 5-7=matig, 0-4=afgewezen)
+        if is_open:
+            verdict_nl     = "Wetenschappelijk ondersteund"
+            verdict_bg     = "#F0FDF4"; verdict_border = "#BBF7D0"
+            verdict_color  = "#15803D"; verdict_sub    = "#166534"
+        elif passed_count >= 5:
+            verdict_nl     = "Beperkte wetenschappelijke ondersteuning"
+            verdict_bg     = "#FFFBEB"; verdict_border = "#FDE68A"
+            verdict_color  = "#B45309"; verdict_sub    = "#92400E"
+        else:
+            verdict_nl     = "Niet wetenschappelijk ondersteund"
+            verdict_bg     = "#FEF2F2"; verdict_border = "#FECACA"
+            verdict_color  = "#DC2626"; verdict_sub    = "#991B1B"
+
+        html = f"""<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+</head>
 <body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;"><tr><td align="center">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;">
+<tr><td align="center">
 <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
-<tr><td style="background:#1E4DA1;border-radius:12px 12px 0 0;padding:28px 36px;text-align:center;">
-  <div style="font-size:22px;font-weight:800;color:#fff;">medifact.eu</div>
-  <div style="font-size:12px;color:#93C5FD;margin-top:4px;text-transform:uppercase;">Evidence Intelligence Platform</div>
+
+  <!-- Header -->
+  <tr><td style="background:#1E4DA1;border-radius:16px 16px 0 0;padding:28px 36px;text-align:center;">
+    <div style="font-size:24px;font-weight:800;color:#fff;letter-spacing:-0.5px;">medifact.eu</div>
+    <div style="font-size:11px;color:#93C5FD;margin-top:4px;letter-spacing:1px;text-transform:uppercase;">Evidence Intelligence Platform</div>
+  </td></tr>
+
+  <!-- Body -->
+  <tr><td style="background:#ffffff;padding:36px 36px 28px;">
+    <p style="font-size:18px;font-weight:700;color:#0F172A;margin:0 0 6px;">Hallo {first_name},</p>
+    <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 28px;">
+      Je analyse is voltooid. Hieronder vind je een samenvatting van het resultaat.
+    </p>
+
+    <!-- Claim -->
+    <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:12px;padding:18px 22px;margin-bottom:16px;">
+      <div style="font-size:11px;font-weight:600;color:#94A3B8;text-transform:uppercase;letter-spacing:0.6px;margin-bottom:8px;">Geanalyseerde claim</div>
+      <div style="font-size:15px;font-weight:600;color:#0F172A;line-height:1.55;">&ldquo;{query[:200]}&rdquo;</div>
+    </div>
+
+    <!-- Verdict -->
+    <div style="background:{verdict_bg};border:1px solid {verdict_border};border-radius:12px;padding:20px 22px;margin-bottom:28px;">
+      <div style="font-size:11px;font-weight:600;color:{verdict_sub};text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px;">Uitkomst</div>
+      <div style="font-size:20px;font-weight:800;color:{verdict_color};margin-bottom:4px;">{verdict_nl}</div>
+      <div style="font-size:13px;color:{verdict_sub};">{passed_count} van {total} wetenschappelijke assen geslaagd</div>
+    </div>
+
+    <!-- CTA -->
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr><td align="center" style="padding-bottom:16px;">
+        <a href="{FRONTEND_URL}/dashboard"
+           style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:16px 48px;border-radius:12px;text-decoration:none;letter-spacing:0.01em;">
+          Bekijk volledig rapport &rarr;
+        </a>
+      </td></tr>
+    </table>
+    <p style="font-size:13px;color:#94A3B8;text-align:center;margin:0;">
+      Je vindt het rapport ook terug onder <strong style="color:#64748B;">Geschiedenis</strong> in je dashboard.
+    </p>
+  </td></tr>
+
+  <!-- Footer -->
+  <tr><td style="background:#F8FAFC;border-radius:0 0 16px 16px;padding:18px 36px;border-top:1px solid #E2E8F0;">
+    <p style="font-size:11px;color:#94A3B8;margin:0;text-align:center;">
+      Je ontvangt dit bericht omdat je een analyse hebt aangevraagd via
+      <a href="{FRONTEND_URL}" style="color:#1E4DA1;text-decoration:none;">medifact.eu</a>
+    </p>
+  </td></tr>
+
+</table>
 </td></tr>
-<tr><td style="background:#ffffff;padding:36px;">
-  <p style="font-size:16px;font-weight:700;color:#0F172A;margin:0 0 8px;">Hallo {first_name},</p>
-  <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 20px;">Je analyse is klaar.</p>
-  <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:16px 20px;margin-bottom:24px;">
-    <div style="font-size:13px;color:#64748B;margin-bottom:6px;">Claim</div>
-    <div style="font-size:14px;font-weight:600;color:#0F172A;">{query[:200]}</div>
-    <div style="margin-top:12px;font-size:13px;color:#64748B;">Uitkomst: <strong style="color:#1E4DA1;">{verdict_nl}</strong> &middot; Score: {score_str}</div>
-  </div>
-  <div style="text-align:center;margin-bottom:20px;">
-    <a href="{FRONTEND_URL}/dashboard" style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">Bekijk resultaat &rarr;</a>
-  </div>
-</td></tr>
-<tr><td style="background:#F8FAFC;border-radius:0 0 12px 12px;padding:20px 36px;border-top:1px solid #E2E8F0;">
-  <p style="font-size:11px;color:#94A3B8;margin:0;"><a href="{FRONTEND_URL}" style="color:#1E4DA1;">medifact.eu</a></p>
-</td></tr>
-</table></td></tr></table></body></html>"""
-        await _send_resend_email(user_email, "Je Medifact analyse is klaar", html)
+</table>
+</body>
+</html>"""
+        await _send_resend_email(user_email, f"Medifact analyse klaar: {verdict_nl}", html)
         print(f"[Worker] Job {job_id} done — emailed {user_email}")
 
     except Exception as e:
