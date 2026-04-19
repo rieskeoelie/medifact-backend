@@ -1602,6 +1602,22 @@ async def get_history(limit: int = 50,
             for a in analyses]
 
 # ── ASYNC JOB QUEUE ────────────────────────────────────────────────────────────
+@app.get("/api/analyze/capacity")
+async def analyze_capacity(db: AsyncSession = Depends(get_db)):
+    """Lightweight check: is the analysis queue under load? No auth required."""
+    max_concurrent = int(os.environ.get("MAX_CONCURRENT_ANALYSES", "4"))
+    try:
+        result = await db.execute(
+            select(func.count(AnalysisJob.id)).where(
+                AnalysisJob.status.in_(["pending", "running"])
+            )
+        )
+        active = result.scalar() or 0
+    except Exception:
+        active = 0
+    return {"busy": active >= max_concurrent, "active": int(active), "max": max_concurrent}
+
+
 @app.post("/api/analyze/queue")
 @limiter.limit("5/minute")
 async def queue_analysis(
