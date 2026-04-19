@@ -549,8 +549,8 @@ async def _process_next_job() -> None:
                 f'</td></tr>'
             )
 
-        # Verdict copy + colours — consistent met site: Bewezen / Deels onderbouwd / Afgewezen
-        if is_open:
+        # Verdict copy + colours — consistent met site: Bewezen=8/8, Deels onderbouwd=5-7/8, Afgewezen=<5
+        if passed_count == total:
             verdict_nl     = "Bewezen"
             verdict_bg     = "#F0FDF4"; verdict_border = "#BBF7D0"
             verdict_color  = "#15803D"; verdict_sub    = "#166534"
@@ -1625,7 +1625,8 @@ async def analyze(request: Request, req: AnalyzeRequest,
     else:
         axis_fns = [run_a1, run_a2, run_a3, run_a4, run_a5, run_a6, run_a7, run_a8]
         results = await asyncio.gather(*[fn(req.query, pr) for fn in axis_fns], return_exceptions=False)
-        await _cache_set(cache_key, [r.dict() for r in results])
+        if any(r.score not in ('—', '-', '0', '') for r in results):
+            await _cache_set(cache_key, [r.dict() for r in results])
 
     failed  = [r for r in results if r.status == "fail"]
     passed  = [r for r in results if r.status == "pass"]
@@ -1738,7 +1739,8 @@ async def analyze_stream(request: Request, query: str, profile: str = "medical",
 
         results = [AxisResult(**{k: v for k, v in c.items() if k not in ("axis_index","type")})
                    for c in sorted(completed, key=lambda x: x["axis_index"]) if "status" in c]
-        await _cache_set(cache_key, [r.dict() for r in results])
+        if any(r.score not in ('—', '-', '0', '') for r in results):
+            await _cache_set(cache_key, [r.dict() for r in results])
         async for chunk in _finish_and_stream(results, from_cache=False):
             yield chunk
         for t in tasks:
