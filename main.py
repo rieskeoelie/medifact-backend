@@ -549,7 +549,7 @@ async def _process_next_job() -> None:
     <div style="background:{verdict_bg};border:1px solid {verdict_border};border-radius:12px;padding:20px 22px;margin-bottom:28px;">
       <div style="font-size:11px;font-weight:600;color:{verdict_sub};text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px;">Uitkomst</div>
       <div style="font-size:20px;font-weight:800;color:{verdict_color};margin-bottom:4px;">{verdict_nl}</div>
-      <div style="font-size:13px;color:{verdict_sub};">{passed_count} van {total} wetenschappelijke assen geslaagd</div>
+      <div style="font-size:13px;color:{verdict_sub};">{passed_count} van {total} wetenschappelijke criteria geslaagd</div>
     </div>
 
     <!-- CTA -->
