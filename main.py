@@ -523,11 +523,29 @@ async def _process_next_job() -> None:
         criteria_rows_html = ""
         for r in results:
             lbl, bg, col, brd = _chip_map.get(r.status, _chip_map['fail'])
-            finding_short = (r.finding[:110] + '…') if len(r.finding) > 110 else r.finding
+            finding_short = (r.finding[:105] + '…') if len(r.finding) > 105 else r.finding
             ax_name = _axis_names.get(r.axis, r.axis)
+            score_str = r.score if r.score and r.score not in ('—', '-', '') else ''
             is_last_row = r == results[-1]
-            border_style = "" if is_last_row else "border-bottom:1px solid #F1F5F9;"
-            criteria_rows_html += f"""<tr><td style="padding:10px 0;{border_style}"><table width="100%" cellpadding="0" cellspacing="0"><tr><td style="font-size:12px;color:#374151;font-weight:700;">{r.axis} · {ax_name}</td><td align="right" style="white-space:nowrap;"><span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:{bg};color:{col};border:1px solid {brd};">{lbl}</span>&nbsp;<span style="font-size:12px;font-weight:700;color:#374151;">{r.score}</span></td></tr><tr><td colspan="2" style="font-size:11px;color:#64748b;padding-top:3px;line-height:1.4;">{finding_short}</td></tr></table></td></tr>"""
+            row_border = '' if is_last_row else 'border-bottom:1px solid #F1F5F9;'
+            score_html = f'<span style="font-size:12px;font-weight:700;color:#374151;margin-left:8px;">{score_str}</span>' if score_str else ''
+            criteria_rows_html += (
+                f'<tr><td style="padding:14px 20px;{row_border}">'
+                f'<table width="100%" cellpadding="0" cellspacing="0">'
+                f'<tr>'
+                f'<td style="vertical-align:middle;">'
+                f'<span style="display:inline-block;font-size:10px;font-weight:800;color:#316BBA;background:#EFF6FF;border-radius:4px;padding:1px 6px;margin-right:7px;letter-spacing:.04em;">{r.axis}</span>'
+                f'<span style="font-size:13px;font-weight:700;color:#0F172A;">{ax_name}</span>'
+                f'</td>'
+                f'<td align="right" style="white-space:nowrap;vertical-align:middle;">'
+                f'<span style="display:inline-block;padding:3px 11px;border-radius:20px;font-size:11px;font-weight:700;background:{bg};color:{col};border:1px solid {brd};">{lbl}</span>'
+                f'{score_html}'
+                f'</td>'
+                f'</tr>'
+                f'<tr><td colspan="2" style="font-size:11px;color:#64748b;padding-top:6px;line-height:1.55;">{finding_short}</td></tr>'
+                f'</table>'
+                f'</td></tr>'
+            )
 
         # Verdict copy + colours — consistent met site: Bewezen / Deels onderbouwd / Afgewezen
         if is_open:
@@ -582,8 +600,8 @@ async def _process_next_job() -> None:
 
     <!-- Criteria -->
     <div style="margin-bottom:28px;">
-      <div style="font-size:11px;font-weight:600;color:#94A3B8;text-transform:uppercase;letter-spacing:0.6px;margin-bottom:10px;">Resultaten per criterium</div>
-      <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #E2E8F0;border-radius:12px;overflow:hidden;background:#fff;">
+      <div style="font-size:11px;font-weight:700;color:#94A3B8;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:12px;">Resultaten per criterium</div>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #E2E8F0;border-radius:12px;overflow:hidden;background:#FAFAFA;">
         {criteria_rows_html}
       </table>
     </div>
