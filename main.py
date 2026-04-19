@@ -41,6 +41,7 @@ FRONTEND_URL      = os.environ.get("FRONTEND_URL", "http://localhost:8000")
 MODEL             = os.environ.get("MEDIFACT_MODEL", "claude-haiku-4-5-20251001")
 NCBI              = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 CT_V2             = "https://clinicaltrials.gov/api/v2/studies"
+NCBI_API_KEY      = os.environ.get("NCBI_API_KEY", "")   # Register at: https://www.ncbi.nlm.nih.gov/account/
 
 stripe.api_key              = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET       = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -66,7 +67,8 @@ TIERS = {
 }
 
 # ── DATABASE ───────────────────────────────────────────────────────────────────
-engine         = create_async_engine(DATABASE_URL, echo=False)
+_pool_kwargs = {"pool_size": 10, "max_overflow": 20, "pool_pre_ping": True} if "postgresql" in DATABASE_URL else {}
+engine         = create_async_engine(DATABASE_URL, echo=False, **_pool_kwargs)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(DeclarativeBase):
@@ -175,6 +177,11 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Admin-Secret"],
 )
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# Shared HTTP client — avoids TCP handshake per call
+_http = httpx.AsyncClient(timeout=15)
+# Max 8 concurrent NCBI requests regardless of how many analyses run simultaneously
+_ncbi_sem = asyncio.Semaphore(8)
 DEFAULT_EMAIL_TEMPLATES = {
     "welcome": {
         "subject": "Welkom bij Medifact — je eerste claim analyseren?",
@@ -366,11 +373,13 @@ async def startup():
 
 
 # ── AUTH UTILITIES ─────────────────────────────────────────────────────────────
-def hash_password(pw: str) -> str:
-    return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt()).decode()
+async def hash_password(pw: str) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt()).decode())
 
-def verify_password(pw: str, hashed: str) -> bool:
-    return _bcrypt.checkpw(pw.encode(), hashed.encode())
+async def verify_password(pw: str, hashed: str) -> bool:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: _bcrypt.checkpw(pw.encode(), hashed.encode()))
 
 def log_security(event: str, **kwargs):
     import json as _json
@@ -571,13 +580,23 @@ PROFILE = {"v": 15, "r": 70, "c": 15, "s": 2, "q": 8, "i": 5, "a": 90, "p": 2,
            "reg": ["GRADE evidence framework", "ICH E6(R2) GCP", "FDA 21 CFR Part 312", "EMA Scientific Guidelines"]}
 
 # ── PUBMED + CT HELPERS ────────────────────────────────────────────────────────
+async def _ncbi_get(url: str, params: dict) -> httpx.Response:
+    """Semaphore-gated NCBI request with exponential backoff on 429."""
+    if NCBI_API_KEY:
+        params = {**params, "api_key": NCBI_API_KEY}
+    for attempt in range(3):
+        async with _ncbi_sem:
+            r = await _http.get(url, params=params, timeout=15)
+        if r.status_code != 429:
+            return r
+        await asyncio.sleep(1.5 ** attempt)
+    return r
+
 async def pm_search(term: str, max_results: int = 10) -> tuple[int, list[str]]:
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{NCBI}/esearch.fcgi",
-                        params={"db": "pubmed", "term": term, "retmax": max_results,
-                                "retmode": "json", "sort": "relevance"}, timeout=12)
-        d = r.json()
-    sr = d.get("esearchresult", {})
+    r = await _ncbi_get(f"{NCBI}/esearch.fcgi",
+                        {"db": "pubmed", "term": term, "retmax": max_results,
+                         "retmode": "json", "sort": "relevance"})
+    sr = r.json().get("esearchresult", {})
     return int(sr.get("count", 0)), sr.get("idlist", [])
 
 async def pm_count(term: str) -> int:
@@ -587,10 +606,9 @@ async def pm_count(term: str) -> int:
 async def pm_fetch(pmids: list[str]) -> list[dict]:
     if not pmids:
         return []
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{NCBI}/efetch.fcgi",
-                        params={"db": "pubmed", "id": ",".join(pmids),
-                                "rettype": "abstract", "retmode": "xml"}, timeout=15)
+    r = await _ncbi_get(f"{NCBI}/efetch.fcgi",
+                        {"db": "pubmed", "id": ",".join(pmids),
+                         "rettype": "abstract", "retmode": "xml"})
     xml = r.text
     papers = []
     for m in re.finditer(r"<PubmedArticle>(.*?)</PubmedArticle>", xml, re.DOTALL):
@@ -617,8 +635,7 @@ async def pm_fetch(pmids: list[str]) -> list[dict]:
 
 async def ct_search(query: str) -> tuple[int, list[dict]]:
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(CT_V2, params={"query.titles": query, "pageSize": 5, "format": "json"}, timeout=10)
+        r = await _http.get(CT_V2, params={"query.titles": query, "pageSize": 5, "format": "json"}, timeout=10)
         d = r.json()
         studies = []
         for s in d.get("studies", []):
@@ -910,7 +927,7 @@ async def register(request: Request, req: RegisterRequest, background_tasks: Bac
         user = User(
             email=req.email.lower().strip(),
             name=req.name.strip(),
-            password_hash=hash_password(req.password),
+            password_hash=await hash_password(req.password),
             tier="free",
             email_verified=False,
             email_verification_token=verification_token,
@@ -954,7 +971,7 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
     # Check lockout before verifying password (prevents timing side-channel)
     if user and user.locked_until and user.locked_until > datetime.now(timezone.utc):
         raise HTTPException(status_code=429, detail="Account tijdelijk geblokkeerd. Probeer over 15 minuten opnieuw.")
-    if not user or not verify_password(req.password, user.password_hash):
+    if not user or not await verify_password(req.password, user.password_hash):
         if user:
             attempts = (user.failed_login_attempts or 0) + 1
             if attempts >= 10:
@@ -1143,7 +1160,7 @@ async def reset_password(request: Request, req: ResetPasswordRequest, db: AsyncS
     if now > expires:
         raise HTTPException(status_code=400, detail="Hersteltoken is verlopen. Vraag een nieuwe aan.")
     await db.execute(
-        update(User).where(User.id == token_obj.user_id).values(password_hash=hash_password(req.password))
+        update(User).where(User.id == token_obj.user_id).values(password_hash=await hash_password(req.password))
     )
     await db.execute(
         update(PasswordResetToken).where(PasswordResetToken.id == token_obj.id).values(used=True)
@@ -1252,7 +1269,8 @@ async def normalize_query(req: NormalizeRequest, current_user: User = Depends(ge
     }
 
 @app.post("/api/analyze")
-async def analyze(req: AnalyzeRequest,
+@limiter.limit("3/minute")
+async def analyze(request: Request, req: AnalyzeRequest,
                   current_user: User = Depends(get_current_user),
                   db: AsyncSession = Depends(get_db)):
     if not ANTHROPIC_API_KEY:
@@ -1294,7 +1312,8 @@ async def analyze(req: AnalyzeRequest,
     }
 
 @app.get("/api/analyze/stream")
-async def analyze_stream(query: str, profile: str = "medical",
+@limiter.limit("3/minute")
+async def analyze_stream(request: Request, query: str, profile: str = "medical",
                          token: Optional[str] = None,
                          authorization: Optional[str] = Header(None),
                          db: AsyncSession = Depends(get_db)):
@@ -1361,7 +1380,7 @@ async def analyze_stream(query: str, profile: str = "medical",
 
     return StreamingResponse(
         event_stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*"}
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
 
 @app.get("/api/history")
