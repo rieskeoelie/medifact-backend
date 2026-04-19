@@ -21,3 +21,6 @@ python-jose[cryptography]>=3.3.0
 
 # Payments
 stripe>=11.0.0
+
+# Rate limiting
+slowapi>=0.1.9

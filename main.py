@@ -14,6 +14,9 @@ from anthropic import AsyncAnthropic
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import bcrypt as _bcrypt
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
@@ -30,7 +33,7 @@ RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
 CRON_SECRET       = os.environ.get("CRON_SECRET", "")
 FROM_EMAIL        = os.environ.get("FROM_EMAIL", "noreply@medifact.eu")
 JWT_ALGORITHM     = "HS256"
-JWT_EXPIRE_DAYS   = 30
+JWT_EXPIRE_DAYS   = 7
 FRONTEND_URL      = os.environ.get("FRONTEND_URL", "http://localhost:8000")
 MODEL             = os.environ.get("MEDIFACT_MODEL", "claude-haiku-4-5-20251001")
 NCBI              = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -137,6 +140,9 @@ class EmailTemplate(Base):
 
 # ── APP SETUP ──────────────────────────────────────────────────────────────────
 app = FastAPI(title="Medifact API", version="3.0.0")
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -835,7 +841,8 @@ def meta_check(results: list[AxisResult]) -> tuple[str, str]:
 # AUTH ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 @app.post("/auth/register")
-async def register(req: RegisterRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+@limiter.limit("3/minute")
+async def register(request: Request, req: RegisterRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     try:
         result = await db.execute(select(User).where(User.email == req.email.lower()))
         if result.scalar_one_or_none():
@@ -870,7 +877,8 @@ async def register(req: RegisterRequest, background_tasks: BackgroundTasks, db: 
         raise HTTPException(status_code=500, detail=f"Register error: {str(e)}")
 
 @app.post("/auth/login")
-async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == req.email.lower()))
     user = result.scalar_one_or_none()
     if not user or not verify_password(req.password, user.password_hash):
@@ -898,7 +906,9 @@ async def me(current_user: User = Depends(get_current_user)):
     }
 
 @app.post("/auth/forgot-password")
+@limiter.limit("3/minute")
 async def forgot_password(
+    request: Request,
     req: ForgotPasswordRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
@@ -1190,10 +1200,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL,
-            "anthropic_key": "set" if ANTHROPIC_API_KEY else "MISSING",
-            "stripe": "configured" if stripe.api_key else "not configured",
-            "database": DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else "local sqlite"}
+    return {"status": "ok"}
 
 @app.get("/api/tiers")
 def get_tiers():
