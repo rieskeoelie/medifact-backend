@@ -4,7 +4,7 @@ Medifact — SaaS API v3.0
 Multi-user · Stripe subscriptions · PostgreSQL · 8-axis scientific gate
 """
 
-import asyncio, hashlib, itertools, json, os, re, secrets, uuid
+import asyncio, hashlib, itertools, json, os, re, secrets, time, uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Annotated
 
@@ -235,6 +235,51 @@ async def _cache_set(key: str, value: list, ttl: int = ANALYSIS_CACHE_TTL) -> No
         await r.setex(key, ttl, json.dumps(value))
     except Exception:
         pass
+
+# ── SLOT TRACKER (Redis sorted set) ────────────────────────────────────────────
+# Each active analysis holds a slot: member=slot_id, score=expiry_timestamp.
+# Expired slots are cleaned automatically on every acquire/count call.
+# TTL of 300 s covers browser crashes that never release their slot.
+_SLOT_KEY = "medifact:analysis_slots"
+_SLOT_TTL = 300  # seconds
+
+_SLOT_ACQUIRE_LUA = """
+local key = KEYS[1]
+local max_slots = tonumber(ARGV[1])
+local slot_id = ARGV[2]
+local expiry = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+local count = redis.call('ZCARD', key)
+if count >= max_slots then
+    return 0
+end
+redis.call('ZADD', key, expiry, slot_id)
+return 1
+"""
+
+async def _slot_acquire(slot_id: str) -> bool:
+    r = await _get_redis()
+    if not r:
+        return True  # fail-open: no Redis → don't block
+    max_slots = int(os.environ.get("MAX_CONCURRENT_ANALYSES", "3"))
+    now = time.time()
+    try:
+        result = await r.eval(_SLOT_ACQUIRE_LUA, 1, _SLOT_KEY,
+                              str(max_slots), slot_id, str(now + _SLOT_TTL), str(now))
+        return bool(result)
+    except Exception:
+        return True  # fail-open on Redis error
+
+async def _slot_release(slot_id: str) -> None:
+    r = await _get_redis()
+    if not r:
+        return
+    try:
+        await r.zrem(_SLOT_KEY, slot_id)
+    except Exception:
+        pass
+
 DEFAULT_EMAIL_TEMPLATES = {
     "welcome": {
         "subject": "Welkom bij Medifact — je eerste claim analyseren?",
@@ -542,9 +587,10 @@ async def startup():
     except Exception as e:
         print(f"❌ DB startup error: {e}")
 
-    # Start background analysis job worker
-    asyncio.create_task(_job_worker())
-    print("✅ Analysis job worker started")
+    # Start 3 parallel background job workers for queued analyses
+    for _ in range(3):
+        asyncio.create_task(_job_worker())
+    print("✅ Analysis job workers started (3 parallel)")
 
 
 
@@ -1603,19 +1649,40 @@ async def get_history(limit: int = 50,
 
 # ── ASYNC JOB QUEUE ────────────────────────────────────────────────────────────
 @app.get("/api/analyze/capacity")
-async def analyze_capacity(db: AsyncSession = Depends(get_db)):
-    """Lightweight check: is the analysis queue under load? No auth required."""
-    max_concurrent = int(os.environ.get("MAX_CONCURRENT_ANALYSES", "4"))
-    try:
-        result = await db.execute(
-            select(func.count(AnalysisJob.id)).where(
-                AnalysisJob.status.in_(["pending", "running"])
-            )
-        )
-        active = result.scalar() or 0
-    except Exception:
+async def analyze_capacity():
+    """Lightweight check: is the platform at capacity? No auth required."""
+    max_concurrent = int(os.environ.get("MAX_CONCURRENT_ANALYSES", "3"))
+    r = await _get_redis()
+    if r:
+        try:
+            await r.zremrangebyscore(_SLOT_KEY, "-inf", time.time())
+            active = await r.zcard(_SLOT_KEY)
+        except Exception:
+            active = 0
+    else:
         active = 0
     return {"busy": active >= max_concurrent, "active": int(active), "max": max_concurrent}
+
+
+@app.post("/api/analyze/slot")
+@limiter.limit("20/minute")
+async def acquire_analysis_slot(request: Request, current_user: User = Depends(get_current_user)):
+    """Atomically reserve a concurrency slot before starting a client-side analysis."""
+    slot_id = str(uuid.uuid4())
+    acquired = await _slot_acquire(slot_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail={"busy": True, "message": "Platform is bezet. Je analyse wordt automatisch ingepland."},
+        )
+    return {"slot_id": slot_id}
+
+
+@app.delete("/api/analyze/slot/{slot_id}")
+async def release_analysis_slot(slot_id: str, current_user: User = Depends(get_current_user)):
+    """Release a concurrency slot after analysis completes or errors."""
+    await _slot_release(slot_id)
+    return {"ok": True}
 
 
 @app.post("/api/analyze/queue")
