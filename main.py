@@ -517,7 +517,7 @@ async def _process_next_job() -> None:
         _chip_map = {
             'pass':   ('Geslaagd',    '#ecfdf5', '#065f46', '#a7f3d0'),
             'border': ('Borderline',  '#fffbeb', '#92400e', '#fde68a'),
-            'fail':   ('Geblokkeerd', '#fef2f2', '#991b1b', '#fecaca'),
+            'fail':   ('Afgewezen',   '#fef2f2', '#991b1b', '#fecaca'),
         }
         _axis_names = {'A1':'Volume','A2':'Recency','A3':'Consensus','A4':'Standaarden','A5':'Kwantitatief','A6':'Onafhankelijkheid','A7':'Toepasbaarheid','A8':'Verifieerbaarheid'}
         criteria_rows_html = ""
