@@ -326,24 +326,32 @@ DEFAULT_EMAIL_TEMPLATES = {
 @app.on_event("startup")
 async def startup():
     try:
+        # Step 1: create new tables in own transaction
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Safe column migrations — ignored if already exist
-            for col_sql in [
-                "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0",
-                "ALTER TABLE users ADD COLUMN locked_until TIMESTAMP WITH TIME ZONE",
-                "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT TRUE",
-                "ALTER TABLE users ADD COLUMN email_verification_token VARCHAR",
-            ]:
-                try:
-                    await conn.execute(text(col_sql))
-                except Exception:
-                    pass
-            # Mark pre-existing accounts as verified so they can still log in
-            await conn.execute(text(
-                "UPDATE users SET email_verified = TRUE WHERE email_verification_token IS NULL"
-            ))
         print("✅ Database tables created/verified")
+
+        # Step 2: column migrations — each in own transaction so one failure can't abort others
+        for col_sql in [
+            "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN locked_until TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE users ADD COLUMN email_verification_token VARCHAR",
+        ]:
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(text(col_sql))
+            except Exception:
+                pass  # Column already exists
+
+        # Step 3: mark pre-existing accounts as verified
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    "UPDATE users SET email_verified = TRUE WHERE email_verification_token IS NULL"
+                ))
+        except Exception:
+            pass
         # Seed default email templates (skip if already exist)
         async with AsyncSessionLocal() as session:
             for key, tpl in DEFAULT_EMAIL_TEMPLATES.items():
