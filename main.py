@@ -841,6 +841,8 @@ def meta_check(results: list[AxisResult]) -> tuple[str, str]:
 @limiter.limit("3/minute")
 async def register(request: Request, req: RegisterRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     try:
+        if len(req.password) < 8:
+            raise HTTPException(status_code=400, detail="Wachtwoord moet minimaal 8 tekens zijn")
         result = await db.execute(select(User).where(User.email == req.email.lower()))
         if result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="E-mailadres al in gebruik")
@@ -937,7 +939,8 @@ async def forgot_password(
     return {"ok": True, "message": "Als dit e-mailadres bekend is, ontvang je een herstelmail."}
 
 @app.post("/auth/reset-password")
-async def reset_password(req: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def reset_password(request: Request, req: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
     """Validate token and set new password."""
     if len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Wachtwoord moet minimaal 8 tekens zijn")
