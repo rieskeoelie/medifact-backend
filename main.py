@@ -487,6 +487,17 @@ async def _process_next_job() -> None:
                 axes_json=json.dumps([r.dict() for r in results]),
                 rid=rid,
             ))
+            # Create a shareable link so the email button works on mobile (no login needed)
+            share = SharedAnalysis(
+                user_id=user_id,
+                sharer_name=user_name,
+                query=query,
+                results_json=json.dumps([r.dict() for r in results]),
+                verdict="open" if is_open else "closed",
+                passed=len(passed),
+                expires_at=datetime.now(timezone.utc) + timedelta(days=60),
+            )
+            db.add(share)
             await db.execute(update(User).where(User.id == user_id).values(
                 analyses_used=User.analyses_used + 1
             ))
@@ -496,6 +507,7 @@ async def _process_next_job() -> None:
                 finished_at=datetime.now(timezone.utc),
             ))
             await db.commit()
+            share_url = f"{FRONTEND_URL}/share/{share.token}"
 
         first_name  = user_name.split()[0] if user_name else "daar"
         passed_count = len(passed)
@@ -555,9 +567,9 @@ async def _process_next_job() -> None:
     <!-- CTA -->
     <table width="100%" cellpadding="0" cellspacing="0">
       <tr><td align="center" style="padding-bottom:16px;">
-        <a href="{FRONTEND_URL}/dashboard"
+        <a href="{share_url}"
            style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:16px 48px;border-radius:12px;text-decoration:none;letter-spacing:0.01em;">
-          Bekijk volledig rapport &rarr;
+          Bekijk resultaat &rarr;
         </a>
       </td></tr>
     </table>
