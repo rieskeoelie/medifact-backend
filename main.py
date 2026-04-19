@@ -18,7 +18,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import bcrypt as _bcrypt
-from jose import JWTError, jwt
+import jwt as _jwt
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update, delete, text
 from sqlalchemy import func
@@ -82,8 +82,12 @@ class User(Base):
     stripe_sub_id       = Column(String, nullable=True)
     analyses_used       = Column(Integer, default=0)
     analyses_reset      = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    is_active           = Column(Boolean, default=True)
-    created_at          = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    is_active               = Column(Boolean, default=True)
+    failed_login_attempts   = Column(Integer, default=0)
+    locked_until            = Column(DateTime(timezone=True), nullable=True)
+    email_verified          = Column(Boolean, default=False)
+    email_verification_token = Column(String, nullable=True)
+    created_at              = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Analysis(Base):
     __tablename__ = "analyses"
@@ -155,7 +159,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://medifact.eu", "https://www.medifact.eu", "http://localhost:3000"],
+    allow_origins=["https://medifact.eu", "https://www.medifact.eu"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Admin-Secret"],
@@ -314,6 +318,21 @@ async def startup():
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Safe column migrations — ignored if already exist
+            for col_sql in [
+                "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN locked_until TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE users ADD COLUMN email_verification_token VARCHAR",
+            ]:
+                try:
+                    await conn.execute(text(col_sql))
+                except Exception:
+                    pass
+            # Mark pre-existing accounts as verified so they can still log in
+            await conn.execute(text(
+                "UPDATE users SET email_verified = TRUE WHERE email_verification_token IS NULL"
+            ))
         print("✅ Database tables created/verified")
         # Seed default email templates (skip if already exist)
         async with AsyncSessionLocal() as session:
@@ -341,7 +360,7 @@ def create_token(user_id: str, email: str) -> str:
         "email": email,
         "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS),
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 async def get_db():
     async with AsyncSessionLocal() as session:
@@ -355,9 +374,9 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Niet ingelogd")
     token = authorization.split(" ", 1)[1]
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_id: str = payload.get("sub")
-    except JWTError:
+    except _jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Ongeldige sessie — log opnieuw in")
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
@@ -854,30 +873,40 @@ async def register(request: Request, req: RegisterRequest, background_tasks: Bac
         result = await db.execute(select(User).where(User.email == req.email.lower()))
         if result.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="E-mailadres al in gebruik")
+        verification_token = secrets.token_urlsafe(32)
         user = User(
             email=req.email.lower().strip(),
             name=req.name.strip(),
             password_hash=hash_password(req.password),
             tier="free",
+            email_verified=False,
+            email_verification_token=verification_token,
         )
         db.add(user)
         await db.commit()
         await db.refresh(user)
-        token = create_token(user.id, user.email)
-        tier_info = TIERS["free"]
-        # Send welcome email in background
+        # Send verification email (not welcome — that comes after verify)
+        verify_url = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+        first_name = user.name.split()[0]
         background_tasks.add_task(
-            _send_email_bg,
-            key="welcome",
+            _send_resend_email,
             to=user.email,
-            variables={"name": user.name.split()[0]},
+            subject="Bevestig je e-mailadres — Medifact",
+            html=f"""<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px 24px">
+<img src="https://medifact.eu/logo.png" alt="Medifact" style="height:40px;margin-bottom:24px">
+<h2 style="font-size:22px;font-weight:900;color:#1e293b;margin:0 0 12px">Hoi {first_name}, bevestig je e-mailadres</h2>
+<p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 24px">
+  Klik op de knop hieronder om je e-mailadres te bevestigen en je account te activeren.
+</p>
+<a href="{verify_url}" style="display:inline-block;background:#316BBA;color:#fff;font-weight:700;font-size:15px;padding:14px 28px;border-radius:10px;text-decoration:none">
+  E-mailadres bevestigen →
+</a>
+<p style="color:#94a3b8;font-size:12px;margin-top:24px">
+  Link geldig voor 48 uur. Niet aangevraagd? Negeer dan deze mail.
+</p>
+</div>""",
         )
-        return {
-            "token": token,
-            "user": {"id": user.id, "email": user.email, "name": user.name,
-                     "tier": user.tier, "tier_name": tier_info["name"],
-                     "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
-        }
+        return {"message": "Registratie succesvol. Controleer je inbox om je e-mailadres te bevestigen."}
     except HTTPException:
         raise
     except Exception as e:
@@ -888,10 +917,27 @@ async def register(request: Request, req: RegisterRequest, background_tasks: Bac
 async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == req.email.lower()))
     user = result.scalar_one_or_none()
+    # Check lockout before verifying password (prevents timing side-channel)
+    if user and user.locked_until and user.locked_until > datetime.now(timezone.utc):
+        raise HTTPException(status_code=429, detail="Account tijdelijk geblokkeerd. Probeer over 15 minuten opnieuw.")
     if not user or not verify_password(req.password, user.password_hash):
+        if user:
+            attempts = (user.failed_login_attempts or 0) + 1
+            if attempts >= 10:
+                user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+                user.failed_login_attempts = 0
+            else:
+                user.failed_login_attempts = attempts
+            await db.commit()
         raise HTTPException(status_code=401, detail="E-mailadres of wachtwoord onjuist")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account geblokkeerd")
+    if not user.email_verified:
+        raise HTTPException(status_code=403, detail="Verifieer eerst je e-mailadres. Controleer je inbox.")
+    # Reset lockout on successful login
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    await db.commit()
     token = create_token(user.id, user.email)
     tier_info = TIERS.get(user.tier, TIERS["free"])
     return {
@@ -900,6 +946,46 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
                  "tier": user.tier, "tier_name": tier_info["name"],
                  "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
     }
+
+@app.get("/auth/verify-email")
+@limiter.limit("10/minute")
+async def verify_email(request: Request, token: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.email_verification_token == token))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=400, detail="Ongeldige of verlopen verificatielink.")
+    user.email_verified = True
+    user.email_verification_token = None
+    await db.commit()
+    return {"ok": True}
+
+@app.post("/auth/resend-verification")
+@limiter.limit("3/minute")
+async def resend_verification(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if user and not user.email_verified:
+        token = secrets.token_urlsafe(32)
+        user.email_verification_token = token
+        await db.commit()
+        verify_url = f"{FRONTEND_URL}/verify-email?token={token}"
+        first_name = user.name.split()[0]
+        await _send_resend_email(
+            to=user.email,
+            subject="Bevestig je e-mailadres — Medifact",
+            html=f"""<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px 24px">
+<img src="https://medifact.eu/logo.png" alt="Medifact" style="height:40px;margin-bottom:24px">
+<h2 style="font-size:22px;font-weight:900;color:#1e293b;margin:0 0 12px">Nieuwe verificatielink, {first_name}</h2>
+<a href="{verify_url}" style="display:inline-block;background:#316BBA;color:#fff;font-weight:700;font-size:15px;padding:14px 28px;border-radius:10px;text-decoration:none">
+  E-mailadres bevestigen →
+</a>
+<p style="color:#94a3b8;font-size:12px;margin-top:24px">Niet aangevraagd? Negeer dan deze mail.</p>
+</div>""",
+        )
+    # Always return 200 to prevent email enumeration
+    return {"ok": True, "message": "Als dit e-mailadres bekend is, ontvang je een nieuwe verificatielink."}
 
 @app.get("/auth/me")
 async def me(current_user: User = Depends(get_current_user)):
@@ -1246,7 +1332,9 @@ class UserPatch(BaseModel):
     is_active:     Optional[bool] = None
 
 @app.get("/admin/users")
+@limiter.limit("30/minute")
 async def admin_list_users(
+    request: Request,
     registered_hours_ago: Optional[int] = None,
     _: str = Depends(verify_admin),
     db: AsyncSession = Depends(get_db),
@@ -1264,7 +1352,9 @@ async def admin_list_users(
     return [user_to_dict(u) for u in result.scalars().all()]
 
 @app.patch("/admin/users/{user_id}")
+@limiter.limit("30/minute")
 async def admin_update_user(
+    request: Request,
     user_id: str,
     patch: UserPatch,
     _: str = Depends(verify_admin),
@@ -1288,7 +1378,9 @@ async def admin_update_user(
     return user_to_dict(user)
 
 @app.delete("/admin/users/{user_id}")
+@limiter.limit("30/minute")
 async def admin_delete_user(
+    request: Request,
     user_id: str,
     _: str = Depends(verify_admin),
     db: AsyncSession = Depends(get_db),
@@ -1305,7 +1397,9 @@ async def admin_delete_user(
     return {"ok": True, "deleted": user_id}
 
 @app.get("/admin/stats")
+@limiter.limit("30/minute")
 async def admin_stats(
+    request: Request,
     _: str = Depends(verify_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1355,14 +1449,16 @@ async def submit_contact(req: ContactRequestBody, db: AsyncSession = Depends(get
     return {"ok": True}
 
 @app.get("/admin/contacts")
-async def admin_contacts(_: str = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
+@limiter.limit("30/minute")
+async def admin_contacts(request: Request, _: str = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ContactRequest).order_by(ContactRequest.created_at.desc()))
     contacts = result.scalars().all()
     return [{"id": c.id, "name": c.name, "email": c.email, "message": c.message,
              "plan": c.plan, "status": c.status, "created_at": c.created_at.isoformat()} for c in contacts]
 
 @app.patch("/admin/contacts/{contact_id}")
-async def admin_update_contact(contact_id: str, data: dict, _: str = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
+@limiter.limit("30/minute")
+async def admin_update_contact(request: Request, contact_id: str, data: dict, _: str = Depends(verify_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ContactRequest).where(ContactRequest.id == contact_id))
     c = result.scalar_one_or_none()
     if not c:
@@ -1680,7 +1776,9 @@ TEMPLATE_META = {
 }
 
 @app.get("/admin/email-templates")
+@limiter.limit("30/minute")
 async def admin_get_templates(
+    request: Request,
     _: str = Depends(verify_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1720,6 +1818,7 @@ async def admin_update_template(
     return {"ok": True, "key": tpl.key, "subject": tpl.subject}
 
 @app.post("/admin/email-templates/test/{key}")
+@limiter.limit("30/minute")
 async def admin_test_template(
     key: str,
     request: Request,
@@ -1742,6 +1841,7 @@ async def admin_test_template(
     return {"ok": ok, "error": err, "template": key, "to": to}
 
 @app.post("/admin/email-templates/test-all")
+@limiter.limit("10/minute")
 async def admin_test_all_templates(
     request: Request,
     _: str = Depends(verify_admin),
