@@ -164,6 +164,20 @@ class EmailTemplate(Base):
     html_body  = Column(Text, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+class AnalysisJob(Base):
+    __tablename__ = "analysis_jobs"
+    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id     = Column(String, nullable=False, index=True)
+    user_email  = Column(String, nullable=False)
+    user_name   = Column(String, nullable=False)
+    query       = Column(String, nullable=False)
+    status      = Column(String, default="pending", index=True)  # pending | running | done | failed
+    result_json = Column(Text, nullable=True)
+    error       = Column(String, nullable=True)
+    created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at  = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
 # ── APP SETUP ──────────────────────────────────────────────────────────────────
 app = FastAPI(title="Medifact API", version="3.0.0")
 
@@ -369,6 +383,125 @@ DEFAULT_EMAIL_TEMPLATES = {
     },
 }
 
+async def _process_next_job() -> None:
+    """Pick up one pending job, run it, email the user."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(AnalysisJob)
+            .where(AnalysisJob.status == "pending")
+            .order_by(AnalysisJob.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+        job = result.scalar_one_or_none()
+        if not job:
+            return
+        job.status = "running"
+        job.started_at = datetime.now(timezone.utc)
+        await db.commit()
+        job_id, user_id = job.id, job.user_id
+        user_email, user_name, query = job.user_email, job.user_name, job.query
+
+    try:
+        cache_key = "medifact:axes:" + hashlib.sha256(query.lower().strip().encode()).hexdigest()[:32]
+        cached = await _cache_get(cache_key)
+        if cached:
+            results = [AxisResult(**r) for r in cached]
+        else:
+            pr = PROFILE
+            axis_fns = [run_a1, run_a2, run_a3, run_a4, run_a5, run_a6, run_a7, run_a8]
+            results = list(await asyncio.gather(*[fn(query, pr) for fn in axis_fns]))
+            await _cache_set(cache_key, [r.dict() for r in results])
+
+        failed = [r for r in results if r.status == "fail"]
+        passed = [r for r in results if r.status == "pass"]
+        meta_s, meta_d = meta_check(list(results))
+        is_open = len(failed) == 0 and meta_s != "FAIL"
+        rid = "MF-" + uuid.uuid4().hex[:8]
+        ts  = datetime.now(timezone.utc).isoformat()
+        result_payload = {
+            "query": query, "profile": "medical", "profile_label": "Medical",
+            "gate": "open" if is_open else "closed",
+            "score": f"{len(passed)}/{len(results)}",
+            "results": [r.dict() for r in results],
+            "meta": {"status": meta_s, "detail": meta_d},
+            "rid": rid, "timestamp": ts,
+            "regulatory": PROFILE.get("reg", []),
+        }
+
+        async with AsyncSessionLocal() as db:
+            db.add(Analysis(
+                user_id=user_id, query=query,
+                gate="open" if is_open else "closed",
+                score=f"{len(passed)}/{len(results)}",
+                axes_json=json.dumps([r.dict() for r in results]),
+                rid=rid,
+            ))
+            await db.execute(update(User).where(User.id == user_id).values(
+                analyses_used=User.analyses_used + 1
+            ))
+            await db.execute(update(AnalysisJob).where(AnalysisJob.id == job_id).values(
+                status="done",
+                result_json=json.dumps(result_payload),
+                finished_at=datetime.now(timezone.utc),
+            ))
+            await db.commit()
+
+        first_name = user_name.split()[0] if user_name else "daar"
+        verdict_nl = "Ondersteund" if is_open else "Niet ondersteund"
+        score_str  = f"{len(passed)}/{len(results)}"
+        html = f"""<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F1F5F9;padding:40px 16px;"><tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+<tr><td style="background:#1E4DA1;border-radius:12px 12px 0 0;padding:28px 36px;text-align:center;">
+  <div style="font-size:22px;font-weight:800;color:#fff;">medifact.eu</div>
+  <div style="font-size:12px;color:#93C5FD;margin-top:4px;text-transform:uppercase;">Evidence Intelligence Platform</div>
+</td></tr>
+<tr><td style="background:#ffffff;padding:36px;">
+  <p style="font-size:16px;font-weight:700;color:#0F172A;margin:0 0 8px;">Hallo {first_name},</p>
+  <p style="font-size:15px;color:#475569;line-height:1.7;margin:0 0 20px;">Je analyse is klaar.</p>
+  <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:16px 20px;margin-bottom:24px;">
+    <div style="font-size:13px;color:#64748B;margin-bottom:6px;">Claim</div>
+    <div style="font-size:14px;font-weight:600;color:#0F172A;">{query[:200]}</div>
+    <div style="margin-top:12px;font-size:13px;color:#64748B;">Uitkomst: <strong style="color:#1E4DA1;">{verdict_nl}</strong> &middot; Score: {score_str}</div>
+  </div>
+  <div style="text-align:center;margin-bottom:20px;">
+    <a href="{FRONTEND_URL}/dashboard" style="display:inline-block;background:#1E4DA1;color:#ffffff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">Bekijk resultaat &rarr;</a>
+  </div>
+</td></tr>
+<tr><td style="background:#F8FAFC;border-radius:0 0 12px 12px;padding:20px 36px;border-top:1px solid #E2E8F0;">
+  <p style="font-size:11px;color:#94A3B8;margin:0;"><a href="{FRONTEND_URL}" style="color:#1E4DA1;">medifact.eu</a></p>
+</td></tr>
+</table></td></tr></table></body></html>"""
+        await _send_resend_email(user_email, "Je Medifact analyse is klaar", html)
+        print(f"[Worker] Job {job_id} done — emailed {user_email}")
+
+    except Exception as e:
+        print(f"[Worker] Job {job_id} failed: {e}")
+        try:
+            async with AsyncSessionLocal() as db:
+                await db.execute(update(AnalysisJob).where(AnalysisJob.id == job_id).values(
+                    status="failed",
+                    error=str(e)[:500],
+                    finished_at=datetime.now(timezone.utc),
+                ))
+                await db.commit()
+        except Exception:
+            pass
+
+
+async def _job_worker() -> None:
+    """Long-running background task: polls for pending jobs every 5 seconds."""
+    await asyncio.sleep(10)  # Let startup finish first
+    while True:
+        try:
+            await _process_next_job()
+        except Exception as e:
+            print(f"[Worker] Unexpected error: {e}")
+        await asyncio.sleep(5)
+
+
 @app.on_event("startup")
 async def startup():
     try:
@@ -408,6 +541,10 @@ async def startup():
         print("✅ Email templates seeded")
     except Exception as e:
         print(f"❌ DB startup error: {e}")
+
+    # Start background analysis job worker
+    asyncio.create_task(_job_worker())
+    print("✅ Analysis job worker started")
 
 
 
@@ -1463,6 +1600,61 @@ async def get_history(limit: int = 50,
     return [{"id": a.id, "query": a.query, "gate": a.gate, "score": a.score,
              "rid": a.rid, "created_at": a.created_at.isoformat() if a.created_at else None}
             for a in analyses]
+
+# ── ASYNC JOB QUEUE ────────────────────────────────────────────────────────────
+@app.post("/api/analyze/queue")
+@limiter.limit("5/minute")
+async def queue_analysis(
+    request: Request,
+    req: AnalyzeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Submit an analysis to the background queue. Returns job_id immediately; result arrives by email."""
+    await check_usage(current_user, db)
+    job = AnalysisJob(
+        user_id=current_user.id,
+        user_email=current_user.email,
+        user_name=current_user.name,
+        query=req.query,
+    )
+    db.add(job)
+    await db.commit()
+    return {
+        "job_id": job.id,
+        "status": "pending",
+        "message": "Analyse ingepland. Je ontvangt een e-mail op zodra het klaar is.",
+    }
+
+
+@app.get("/api/analyze/queue/{job_id}")
+async def get_job_status(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Poll the status of a queued analysis. Returns full result when done."""
+    result = await db.execute(
+        select(AnalysisJob).where(
+            AnalysisJob.id == job_id,
+            AnalysisJob.user_id == current_user.id,   # users can only see their own jobs
+        )
+    )
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job niet gevonden")
+    resp: dict = {
+        "job_id": job.id,
+        "status": job.status,
+        "query": job.query,
+        "created_at": job.created_at.isoformat(),
+    }
+    if job.status == "done" and job.result_json:
+        resp["result"] = json.loads(job.result_json)
+    if job.status == "failed":
+        resp["error"] = job.error
+    return resp
+
 
 # ── PUBLIC ENDPOINTS ───────────────────────────────────────────────────────────
 @app.get("/")
