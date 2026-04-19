@@ -20,7 +20,7 @@ from slowapi.errors import RateLimitExceeded
 import bcrypt as _bcrypt
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update, text
+from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update, delete, text
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
@@ -28,7 +28,9 @@ from sqlalchemy.orm import DeclarativeBase
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./medifact.db").replace("postgres://", "postgresql+asyncpg://")
-JWT_SECRET        = os.environ.get("JWT_SECRET", "change-this-to-a-random-secret-in-production")
+JWT_SECRET        = os.environ.get("JWT_SECRET", "")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET environment variable is not set")
 RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
 CRON_SECRET       = os.environ.get("CRON_SECRET", "")
 FROM_EMAIL        = os.environ.get("FROM_EMAIL", "noreply@medifact.eu")
@@ -144,8 +146,11 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["https://medifact.eu", "https://www.medifact.eu", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Secret"],
 )
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 DEFAULT_EMAIL_TEMPLATES = {
@@ -313,14 +318,6 @@ async def startup():
     except Exception as e:
         print(f"❌ DB startup error: {e}")
 
-@app.get("/debug/db")
-async def debug_db():
-    try:
-        async with engine.begin() as conn:
-            result = await conn.execute(text("SELECT 1"))
-            return {"db": "ok", "url": DATABASE_URL.split("@")[-1]}
-    except Exception as e:
-        return {"db": "error", "detail": str(e)}
 
 
 # ── AUTH UTILITIES ─────────────────────────────────────────────────────────────
@@ -1213,7 +1210,9 @@ def get_tiers():
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
 
 def verify_admin(x_admin_secret: Annotated[str, Header()] = ""):
-    if not ADMIN_SECRET or x_admin_secret != ADMIN_SECRET:
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=500, detail="ADMIN_SECRET not configured")
+    if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def user_to_dict(u: User) -> dict:
@@ -1289,7 +1288,7 @@ async def admin_delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     # Also delete analyses
-    await db.execute(text(f"DELETE FROM analyses WHERE user_id = '{user_id}'"))
+    await db.execute(delete(Analysis).where(Analysis.user_id == user_id))
     await db.delete(user)
     await db.commit()
     return {"ok": True, "deleted": user_id}
@@ -1596,7 +1595,9 @@ async def weekly_digest(
     Call from Railway cron: POST /cron/weekly-digest weekly.
     """
     auth = request.headers.get("authorization", "")
-    if CRON_SECRET and auth != f"Bearer {CRON_SECRET}":
+    if not CRON_SECRET:
+        raise HTTPException(status_code=500, detail="CRON_SECRET not configured")
+    if auth != f"Bearer {CRON_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     result = await db.execute(select(User).where(User.is_active == True))
@@ -1635,7 +1636,9 @@ async def test_email(
 ):
     """Send a single test email to verify Resend config. Protected by CRON_SECRET."""
     auth = request.headers.get("authorization", "")
-    if CRON_SECRET and auth != f"Bearer {CRON_SECRET}":
+    if not CRON_SECRET:
+        raise HTTPException(status_code=500, detail="CRON_SECRET not configured")
+    if auth != f"Bearer {CRON_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
     body = await request.json()
     to = body.get("to", "")
