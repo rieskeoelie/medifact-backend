@@ -34,8 +34,9 @@ if not JWT_SECRET:
 RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
 CRON_SECRET       = os.environ.get("CRON_SECRET", "")
 FROM_EMAIL        = os.environ.get("FROM_EMAIL", "noreply@medifact.eu")
-JWT_ALGORITHM     = "HS256"
-JWT_EXPIRE_DAYS   = 7
+JWT_ALGORITHM        = "HS256"
+JWT_EXPIRE_MINUTES   = 15
+REFRESH_EXPIRE_DAYS  = 30
 FRONTEND_URL      = os.environ.get("FRONTEND_URL", "http://localhost:8000")
 MODEL             = os.environ.get("MEDIFACT_MODEL", "claude-haiku-4-5-20251001")
 NCBI              = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -135,6 +136,15 @@ class PasswordResetToken(Base):
                         default=lambda: secrets.token_urlsafe(32))
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used       = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id    = Column(String, nullable=False, index=True)
+    token      = Column(String, unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    revoked    = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class EmailTemplate(Base):
@@ -354,13 +364,28 @@ def hash_password(pw: str) -> str:
 def verify_password(pw: str, hashed: str) -> bool:
     return _bcrypt.checkpw(pw.encode(), hashed.encode())
 
+def log_security(event: str, **kwargs):
+    import json as _json
+    print(_json.dumps({"sec": event, "ts": datetime.now(timezone.utc).isoformat(), **kwargs}), flush=True)
+
 def create_token(user_id: str, email: str) -> str:
     payload = {
         "sub": user_id,
         "email": email,
-        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES),
     }
     return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+async def create_refresh_token(user_id: str, db: AsyncSession) -> str:
+    token = secrets.token_urlsafe(48)
+    rt = RefreshToken(
+        user_id=user_id,
+        token=token,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=REFRESH_EXPIRE_DAYS),
+    )
+    db.add(rt)
+    await db.commit()
+    return token
 
 async def get_db():
     async with AsyncSessionLocal() as session:
@@ -906,6 +931,7 @@ async def register(request: Request, req: RegisterRequest, background_tasks: Bac
 </p>
 </div>""",
         )
+        log_security("registration", email=user.email)
         return {"message": "Registratie succesvol. Controleer je inbox om je e-mailadres te bevestigen."}
     except HTTPException:
         raise
@@ -926,9 +952,13 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
             if attempts >= 10:
                 user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=15)
                 user.failed_login_attempts = 0
+                log_security("account_locked", email=req.email.lower())
             else:
                 user.failed_login_attempts = attempts
+                log_security("login_failed", email=req.email.lower(), attempt=attempts)
             await db.commit()
+        else:
+            log_security("login_unknown_email", email=req.email.lower())
         raise HTTPException(status_code=401, detail="E-mailadres of wachtwoord onjuist")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account geblokkeerd")
@@ -938,10 +968,14 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
     user.failed_login_attempts = 0
     user.locked_until = None
     await db.commit()
-    token = create_token(user.id, user.email)
+    access_token = create_token(user.id, user.email)
+    refresh_token = await create_refresh_token(user.id, db)
     tier_info = TIERS.get(user.tier, TIERS["free"])
+    log_security("login_success", user_id=user.id, email=user.email, tier=user.tier)
     return {
-        "token": token,
+        "token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": JWT_EXPIRE_MINUTES * 60,
         "user": {"id": user.id, "email": user.email, "name": user.name,
                  "tier": user.tier, "tier_name": tier_info["name"],
                  "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
@@ -957,6 +991,53 @@ async def verify_email(request: Request, token: str, db: AsyncSession = Depends(
     user.email_verified = True
     user.email_verification_token = None
     await db.commit()
+    log_security("email_verified", user_id=user.id, email=user.email)
+    return {"ok": True}
+
+@app.post("/auth/refresh")
+@limiter.limit("20/minute")
+async def refresh_token(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.json()
+    raw = body.get("refresh_token", "")
+    if not raw:
+        raise HTTPException(status_code=401, detail="Refresh token ontbreekt.")
+    result = await db.execute(
+        select(RefreshToken).where(RefreshToken.token == raw, RefreshToken.revoked == False)
+    )
+    rt = result.scalar_one_or_none()
+    if not rt or rt.expires_at < datetime.now(timezone.utc):
+        log_security("refresh_invalid", token_prefix=raw[:8])
+        raise HTTPException(status_code=401, detail="Refresh token ongeldig of verlopen. Log opnieuw in.")
+    # Rotate: revoke old, issue new
+    rt.revoked = True
+    user_result = await db.execute(select(User).where(User.id == rt.user_id))
+    user = user_result.scalar_one_or_none()
+    if not user or not user.is_active:
+        await db.commit()
+        raise HTTPException(status_code=401, detail="Gebruiker niet gevonden.")
+    new_access = create_token(user.id, user.email)
+    new_refresh = await create_refresh_token(user.id, db)
+    tier_info = TIERS.get(user.tier, TIERS["free"])
+    log_security("token_refreshed", user_id=user.id)
+    return {
+        "token": new_access,
+        "refresh_token": new_refresh,
+        "expires_in": JWT_EXPIRE_MINUTES * 60,
+        "user": {"id": user.id, "email": user.email, "name": user.name,
+                 "tier": user.tier, "tier_name": tier_info["name"],
+                 "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
+    }
+
+@app.post("/auth/logout")
+@limiter.limit("20/minute")
+async def logout(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.json()
+    raw = body.get("refresh_token", "")
+    if raw:
+        await db.execute(
+            update(RefreshToken).where(RefreshToken.token == raw).values(revoked=True)
+        )
+        await db.commit()
     return {"ok": True}
 
 @app.post("/auth/resend-verification")
@@ -1060,6 +1141,7 @@ async def reset_password(request: Request, req: ResetPasswordRequest, db: AsyncS
         update(PasswordResetToken).where(PasswordResetToken.id == token_obj.id).values(used=True)
     )
     await db.commit()
+    log_security("password_reset_complete", user_id=user.id)
     return {"ok": True, "message": "Wachtwoord succesvol gewijzigd."}
 
 # ══════════════════════════════════════════════════════════════════════════════
