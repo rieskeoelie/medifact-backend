@@ -692,6 +692,30 @@ async def startup():
                 ))
         except Exception:
             pass
+
+        # Step 4: ensure mollie_topup_credits table exists (also created by
+        # Next.js webhook, idempotent). Schema must stay in sync with
+        # lib/mollie-db.ts ensureTopupTable().
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS mollie_topup_credits (
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(100) NOT NULL,
+                        analyses_remaining INT NOT NULL DEFAULT 0,
+                        analyses_purchased INT NOT NULL DEFAULT 0,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT now()
+                    )
+                """))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_topup_user_active "
+                    "ON mollie_topup_credits(user_id, expires_at) "
+                    "WHERE analyses_remaining > 0"
+                ))
+        except Exception as e:
+            print(f"⚠️ mollie_topup_credits ensure failed (non-fatal): {e}")
+
         # Seed default email templates (skip if already exist)
         async with AsyncSessionLocal() as session:
             for key, tpl in DEFAULT_EMAIL_TEMPLATES.items():
@@ -764,8 +788,64 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Gebruiker niet gevonden")
     return user
 
+async def get_active_topup_credits(user_id: str, db: AsyncSession) -> int:
+    """
+    Return the sum of unused, unexpired top-up credits for a user.
+
+    The mollie_topup_credits table is owned by the Next.js webhook
+    (lib/mollie-db.ts). Rows are inserted on successful Mollie payment with
+    expires_at = now() + 30 days. Expired rows are filtered out here.
+    """
+    result = await db.execute(
+        text("""
+            SELECT COALESCE(SUM(analyses_remaining), 0)::int AS total
+            FROM mollie_topup_credits
+            WHERE user_id = :uid
+              AND expires_at > now()
+              AND analyses_remaining > 0
+        """),
+        {"uid": user_id},
+    )
+    return int(result.scalar_one())
+
+
+async def decrement_topup_credit(user_id: str, db: AsyncSession) -> bool:
+    """
+    Decrement one credit from the user's earliest-expiring active top-up row.
+
+    Uses FOR UPDATE SKIP LOCKED so concurrent analyses can never decrement
+    the same row twice — each request grabs a different row, or returns
+    False if no row is currently available.
+
+    Returns True when a credit was deducted, False otherwise.
+    """
+    result = await db.execute(
+        text("""
+            UPDATE mollie_topup_credits
+            SET analyses_remaining = analyses_remaining - 1
+            WHERE id = (
+                SELECT id FROM mollie_topup_credits
+                WHERE user_id = :uid
+                  AND expires_at > now()
+                  AND analyses_remaining > 0
+                ORDER BY expires_at ASC, created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id
+        """),
+        {"uid": user_id},
+    )
+    await db.commit()
+    return result.rowcount > 0
+
+
 async def check_usage(user: User, db: AsyncSession):
-    """Reset monthly counter if needed, then check limit."""
+    """Reset monthly counter if needed, then check limit.
+
+    Tier quota is consumed first; once exhausted, active top-up credits
+    extend the limit. Raises 429 only when both tier and top-ups are empty.
+    """
     now = datetime.now(timezone.utc)
     reset = user.analyses_reset
     if reset.tzinfo is None:
@@ -777,11 +857,16 @@ async def check_usage(user: User, db: AsyncSession):
         await db.commit()
         user.analyses_used = 0
     limit = TIERS.get(user.tier, TIERS["free"])["analyses"]
-    if user.analyses_used >= limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Maandlimiet bereikt ({limit} analyses voor {TIERS[user.tier]['name']}). Upgrade je abonnement."
-        )
+    if user.analyses_used < limit:
+        return  # tier quota still available
+    # Tier exhausted — fall back to top-up credits
+    extra = await get_active_topup_credits(user.id, db)
+    if extra > 0:
+        return
+    raise HTTPException(
+        status_code=429,
+        detail=f"Maandlimiet bereikt ({limit} analyses voor {TIERS[user.tier]['name']}). Upgrade je abonnement."
+    )
 
 def _render_template(html: str, variables: dict) -> str:
     """Replace {{var}} placeholders in template HTML."""
@@ -820,11 +905,34 @@ async def _send_templated_email(db: AsyncSession, key: str, to: str, variables: 
     return await _send_resend_email(to, subject, html)
 
 async def increment_usage(user: User, db: AsyncSession):
-    new_count = user.analyses_used + 1
-    await db.execute(
-        update(User).where(User.id == user.id).values(analyses_used=new_count)
-    )
-    await db.commit()
+    """
+    Charge one analysis: tier quota first, then top-up credits.
+
+    When the tier bucket is full we decrement the earliest-expiring active
+    top-up row (FIFO). If that decrement fails — race with another concurrent
+    analysis or credit just expired — fall back to incrementing analyses_used
+    so usage is never silently dropped, and log a warning.
+    """
+    tier_limit = TIERS.get(user.tier, TIERS["free"])["analyses"]
+    if user.analyses_used < tier_limit:
+        new_count = user.analyses_used + 1
+        await db.execute(
+            update(User).where(User.id == user.id).values(analyses_used=new_count)
+        )
+        await db.commit()
+    else:
+        deducted = await decrement_topup_credit(user.id, db)
+        if deducted:
+            new_count = user.analyses_used  # tier counter unchanged; top-up consumed
+        else:
+            # Race or expiry between check_usage and increment_usage —
+            # safest is to record the analysis as tier-usage and log it.
+            log_security("topup_decrement_failed_after_check", user_id=user.id, tier=user.tier)
+            new_count = user.analyses_used + 1
+            await db.execute(
+                update(User).where(User.id == user.id).values(analyses_used=new_count)
+            )
+            await db.commit()
     # Low-credits warning: send when free user hits 8 out of 10
     if user.tier == "free" and new_count == 8:
         remaining = 10 - new_count
@@ -1433,13 +1541,15 @@ async def resend_verification(request: Request, db: AsyncSession = Depends(get_d
     return {"ok": True, "message": "Als dit e-mailadres bekend is, ontvang je een nieuwe verificatielink."}
 
 @app.get("/auth/me")
-async def me(current_user: User = Depends(get_current_user)):
+async def me(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     tier_info = TIERS.get(current_user.tier, TIERS["free"])
+    topup_remaining = await get_active_topup_credits(current_user.id, db)
     return {
         "id": current_user.id, "email": current_user.email, "name": current_user.name,
         "tier": current_user.tier, "tier_name": tier_info["name"],
         "tier_price": tier_info["price"],
         "analyses_used": current_user.analyses_used, "analyses_limit": tier_info["analyses"],
+        "topup_credits_remaining": topup_remaining,
         "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
     }
 
@@ -1882,18 +1992,20 @@ def verify_admin(x_admin_secret: Annotated[str, Header()] = ""):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-def user_to_dict(u: User) -> dict:
+async def user_to_dict(u: User, db: AsyncSession) -> dict:
+    topup_remaining = await get_active_topup_credits(u.id, db)
     return {
-        "id":              u.id,
-        "email":           u.email,
-        "name":            u.name,
-        "tier":            u.tier,
-        "tier_name":       TIERS.get(u.tier, {}).get("name", u.tier),
-        "analyses_used":   u.analyses_used,
-        "analyses_limit":  TIERS.get(u.tier, {}).get("analyses", 10),
-        "is_active":       u.is_active,
-        "stripe_sub_id":   u.stripe_sub_id,
-        "created_at":      u.created_at.isoformat() if u.created_at else None,
+        "id":                       u.id,
+        "email":                    u.email,
+        "name":                     u.name,
+        "tier":                     u.tier,
+        "tier_name":                TIERS.get(u.tier, {}).get("name", u.tier),
+        "analyses_used":            u.analyses_used,
+        "analyses_limit":           TIERS.get(u.tier, {}).get("analyses", 10),
+        "topup_credits_remaining":  topup_remaining,
+        "is_active":                u.is_active,
+        "stripe_sub_id":            u.stripe_sub_id,
+        "created_at":               u.created_at.isoformat() if u.created_at else None,
     }
 
 class UserPatch(BaseModel):
@@ -1919,7 +2031,7 @@ async def admin_list_users(
         window_start = datetime.now(timezone.utc) - timedelta(hours=registered_hours_ago + 1)
         stmt = stmt.where(User.created_at >= window_start, User.created_at <= window_end)
     result = await db.execute(stmt)
-    return [user_to_dict(u) for u in result.scalars().all()]
+    return [await user_to_dict(u, db) for u in result.scalars().all()]
 
 @app.patch("/admin/users/{user_id}")
 @limiter.limit("30/minute")
@@ -1945,7 +2057,7 @@ async def admin_update_user(
         user.is_active = patch.is_active
     await db.commit()
     await db.refresh(user)
-    return user_to_dict(user)
+    return await user_to_dict(user, db)
 
 @app.delete("/admin/users/{user_id}")
 @limiter.limit("30/minute")
