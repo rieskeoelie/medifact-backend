@@ -734,8 +734,22 @@ async def startup():
                     "CREATE INDEX IF NOT EXISTS idx_topup_payment_id "
                     "ON mollie_topup_credits(mollie_payment_id)"
                 ))
+                # credits_at_reversal: snapshot of analyses_remaining at the
+                # moment of reversal, so admin dashboard can report "N al gebruikt".
+                # Owned/written by Next.js reverseTopupForPayment().
+                await conn.execute(text(
+                    "ALTER TABLE mollie_topup_credits "
+                    "ADD COLUMN IF NOT EXISTS credits_at_reversal INT"
+                ))
+                # amount_refunded_eur on payments: lets admin dashboard query
+                # subscription/topup refunds without calling Mollie API live.
+                # Updated by Next.js webhook on refund detection.
+                await conn.execute(text(
+                    "ALTER TABLE mollie_payments "
+                    "ADD COLUMN IF NOT EXISTS amount_refunded_eur NUMERIC(10,2) DEFAULT 0"
+                ))
         except Exception as e:
-            print(f"⚠️ mollie_topup_credits refund columns ensure failed (non-fatal): {e}")
+            print(f"⚠️ mollie refund columns ensure failed (non-fatal): {e}")
 
         # Seed default email templates (skip if already exist)
         async with AsyncSessionLocal() as session:
