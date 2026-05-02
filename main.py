@@ -716,6 +716,27 @@ async def startup():
         except Exception as e:
             print(f"⚠️ mollie_topup_credits ensure failed (non-fatal): {e}")
 
+        # Step 5: refund-tracking columns on mollie_topup_credits.
+        # mollie_payment_id links a credit row back to its source payment so
+        # webhook-driven refunds can reverse the right row. reversed_at is set
+        # when reversal happens (idempotent guard against double-processing).
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    "ALTER TABLE mollie_topup_credits "
+                    "ADD COLUMN IF NOT EXISTS mollie_payment_id VARCHAR(100)"
+                ))
+                await conn.execute(text(
+                    "ALTER TABLE mollie_topup_credits "
+                    "ADD COLUMN IF NOT EXISTS reversed_at TIMESTAMPTZ"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS idx_topup_payment_id "
+                    "ON mollie_topup_credits(mollie_payment_id)"
+                ))
+        except Exception as e:
+            print(f"⚠️ mollie_topup_credits refund columns ensure failed (non-fatal): {e}")
+
         # Seed default email templates (skip if already exist)
         async with AsyncSessionLocal() as session:
             for key, tpl in DEFAULT_EMAIL_TEMPLATES.items():
