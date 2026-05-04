@@ -1478,6 +1478,7 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
     access_token = create_token(user.id, user.email)
     refresh_token = await create_refresh_token(user.id, db)
     tier_info = TIERS.get(user.tier, TIERS["free"])
+    topup_remaining = await get_active_topup_credits(user.id, db)
     log_security("login_success", user_id=user.id, email=user.email, tier=user.tier)
     return {
         "token": access_token,
@@ -1485,7 +1486,8 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
         "expires_in": JWT_EXPIRE_MINUTES * 60,
         "user": {"id": user.id, "email": user.email, "name": user.name,
                  "tier": user.tier, "tier_name": tier_info["name"],
-                 "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
+                 "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"],
+                 "topup_credits_remaining": topup_remaining},
     }
 
 @app.get("/auth/verify-email")
@@ -1525,6 +1527,7 @@ async def refresh_token(request: Request, db: AsyncSession = Depends(get_db)):
     new_access = create_token(user.id, user.email)
     new_refresh = await create_refresh_token(user.id, db)
     tier_info = TIERS.get(user.tier, TIERS["free"])
+    topup_remaining = await get_active_topup_credits(user.id, db)
     log_security("token_refreshed", user_id=user.id)
     return {
         "token": new_access,
@@ -1532,7 +1535,8 @@ async def refresh_token(request: Request, db: AsyncSession = Depends(get_db)):
         "expires_in": JWT_EXPIRE_MINUTES * 60,
         "user": {"id": user.id, "email": user.email, "name": user.name,
                  "tier": user.tier, "tier_name": tier_info["name"],
-                 "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"]},
+                 "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"],
+                 "topup_credits_remaining": topup_remaining},
     }
 
 @app.post("/auth/logout")
