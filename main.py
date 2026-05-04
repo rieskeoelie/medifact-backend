@@ -968,13 +968,17 @@ async def increment_usage(user: User, db: AsyncSession):
                 update(User).where(User.id == user.id).values(analyses_used=new_count)
             )
             await db.commit()
-    # Low-credits warning: send when free user hits 8 out of 10
-    if user.tier == "free" and new_count == 8:
-        remaining = 10 - new_count
-        asyncio.create_task(_send_email_bg(
-            key="low_credits", to=user.email,
-            variables={"name": user.name.split()[0], "remaining": remaining, "analyses_used": new_count},
-        ))
+    # Low-credits warning: trigger on 80% usage of tier_limit for free users.
+    # Previously hardcoded to "8 out of 10" which never triggered since free
+    # is now 5 analyses (and remaining math used wrong base of 10).
+    if user.tier == "free":
+        warn_at = max(1, int(tier_limit * 0.8))  # 4 for free=5 (1 analysis remaining)
+        if new_count == warn_at:
+            remaining = tier_limit - new_count
+            asyncio.create_task(_send_email_bg(
+                key="low_credits", to=user.email,
+                variables={"name": user.name.split()[0], "remaining": remaining, "analyses_used": new_count},
+            ))
 
 # ── PYDANTIC SCHEMAS ───────────────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
