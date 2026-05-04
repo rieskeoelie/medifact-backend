@@ -829,7 +829,12 @@ async def get_active_topup_credits(user_id: str, db: AsyncSession) -> int:
 
     The mollie_topup_credits table is owned by the Next.js webhook
     (lib/mollie-db.ts). Rows are inserted on successful Mollie payment with
-    expires_at = now() + 30 days. Expired rows are filtered out here.
+    expires_at = now() + 30 days. Expired and reversed rows are excluded.
+
+    Defensively filters reversed_at IS NULL alongside analyses_remaining > 0;
+    today the reversal flow always sets remaining=0 so they're equivalent,
+    but the explicit filter survives any future refactor that decouples
+    those fields.
     """
     result = await db.execute(
         text("""
@@ -838,6 +843,7 @@ async def get_active_topup_credits(user_id: str, db: AsyncSession) -> int:
             WHERE user_id = :uid
               AND expires_at > now()
               AND analyses_remaining > 0
+              AND reversed_at IS NULL
         """),
         {"uid": user_id},
     )
@@ -2053,6 +2059,7 @@ async def get_active_topup_credits_bulk(user_ids: list[str], db: AsyncSession) -
             WHERE user_id = ANY(:ids)
               AND expires_at > now()
               AND analyses_remaining > 0
+              AND reversed_at IS NULL
             GROUP BY user_id
         """),
         {"ids": user_ids},
