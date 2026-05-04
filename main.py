@@ -4,7 +4,7 @@ Medifact — SaaS API v3.0
 Multi-user · Stripe subscriptions · PostgreSQL · 8-axis scientific gate
 """
 
-import asyncio, hashlib, itertools, json, os, re, secrets, time, uuid
+import asyncio, hashlib, hmac, itertools, json, os, re, secrets, time, uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Annotated
 
@@ -98,6 +98,7 @@ class User(Base):
     locked_until            = Column(DateTime(timezone=True), nullable=True)
     email_verified          = Column(Boolean, default=False)
     email_verification_token = Column(String, nullable=True)
+    digest_subscribed       = Column(Boolean, default=True)
     created_at              = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Analysis(Base):
@@ -677,6 +678,7 @@ async def startup():
             "ALTER TABLE users ADD COLUMN locked_until TIMESTAMP WITH TIME ZONE",
             "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN email_verification_token VARCHAR",
+            "ALTER TABLE users ADD COLUMN digest_subscribed BOOLEAN DEFAULT TRUE",
         ]:
             try:
                 async with engine.begin() as conn:
@@ -789,6 +791,18 @@ def create_token(user_id: str, email: str) -> str:
         "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES),
     }
     return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+# ── Digest unsubscribe tokens ────────────────────────────────────────────────
+# One-click unsubscribe links in the weekly digest email must work without
+# a login (CAN-SPAM + AVG requirement). We sign user_id with HMAC-SHA256
+# using JWT_SECRET so the link can't be forged for another user. Tokens are
+# stable per user (no expiry) — same email reuses the same link forever.
+def digest_unsub_token(user_id: str) -> str:
+    return hmac.new(JWT_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:24]
+
+def verify_digest_unsub_token(user_id: str, token: str) -> bool:
+    expected = digest_unsub_token(user_id)
+    return hmac.compare_digest(expected, token or "")
 
 async def create_refresh_token(user_id: str, db: AsyncSession) -> str:
     token = secrets.token_urlsafe(48)
@@ -2369,7 +2383,7 @@ async def get_recent_analyses(
 # ══════════════════════════════════════════════════════════════════════════════
 # WEEKLY DIGEST EMAIL (#18)
 # ══════════════════════════════════════════════════════════════════════════════
-def _digest_html(user_name: str, tier_name: str, used: int, limit: int) -> str:
+def _digest_html(user_name: str, tier_name: str, used: int, limit: int, unsub_url: str = "") -> str:
     rem = max(0, limit - used) if limit != 999999 else None
     pct = min(100, round((used / limit) * 100)) if limit != 999999 else 0
     bar_color = "#ef4444" if pct >= 90 else "#f59e0b" if pct >= 70 else "#10b981"
@@ -2434,7 +2448,7 @@ def _digest_html(user_name: str, tier_name: str, used: int, limit: int) -> str:
   <tr><td style="background:#f8fafc;padding:20px 40px;text-align:center;border-top:1px solid #e2e8f0;">
     <p style="font-size:12px;color:#94a3b8;margin:0;">
       Medifact · medifact.eu<br>
-      <a href="https://medifact.eu/dashboard/settings" style="color:#94a3b8;">Afmelden van digest</a>
+      <a href="{unsub_url or 'https://medifact.eu/dashboard/settings'}" style="color:#94a3b8;">Afmelden van digest</a>
     </p>
   </td></tr>
 
@@ -2469,6 +2483,42 @@ async def _send_resend_email(to: str, subject: str, html: str) -> tuple[bool, st
         return False, msg
 
 
+@app.get("/api/digest/unsubscribe")
+async def digest_unsubscribe(
+    u: str = "",
+    t: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    One-click unsubscribe from weekly digest. Public endpoint (no auth) —
+    URL is signed with HMAC(JWT_SECRET, user_id) so it can't be forged.
+    Linked from the digest email footer; called via the medifact.eu proxy
+    route so users see a branded URL.
+    """
+    from fastapi.responses import HTMLResponse
+    if not u or not t or not verify_digest_unsub_token(u, t):
+        return HTMLResponse(
+            "<html><body style='font-family:sans-serif;max-width:500px;margin:80px auto;padding:0 20px;text-align:center'>"
+            "<h2 style='color:#1e293b'>Ongeldige link</h2>"
+            "<p style='color:#64748b'>Deze afmeld-link is verlopen of beschadigd. "
+            "Log in op <a href='https://medifact.eu/login' style='color:#316BBA'>medifact.eu</a> en "
+            "wijzig je voorkeuren in je account.</p></body></html>",
+            status_code=400,
+        )
+    res = await db.execute(select(User).where(User.id == u))
+    user = res.scalar_one_or_none()
+    if user and user.digest_subscribed:
+        user.digest_subscribed = False
+        await db.commit()
+    return HTMLResponse(
+        "<html><body style='font-family:sans-serif;max-width:500px;margin:80px auto;padding:0 20px;text-align:center'>"
+        "<h2 style='color:#1e293b'>Afgemeld ✓</h2>"
+        "<p style='color:#64748b'>Je ontvangt geen wekelijkse digest meer van Medifact. "
+        "Wil je je weer aanmelden? Log in op <a href='https://medifact.eu/login' style='color:#316BBA'>medifact.eu</a> "
+        "en zet de digest aan in je instellingen.</p></body></html>"
+    )
+
+
 @app.post("/cron/weekly-digest")
 async def weekly_digest(
     request: Request,
@@ -2485,7 +2535,11 @@ async def weekly_digest(
     if auth != f"Bearer {CRON_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    result = await db.execute(select(User).where(User.is_active == True))
+    # Only opted-in users. digest_subscribed defaults to True for new users
+    # but is flipped to False by /api/digest/unsubscribe?u=...&t=...
+    result = await db.execute(
+        select(User).where(User.is_active == True, User.digest_subscribed == True)
+    )
     users = result.scalars().all()
 
     sent = 0
@@ -2494,11 +2548,13 @@ async def weekly_digest(
     for u in users:
         tier_info = TIERS.get(u.tier, TIERS["free"])
         limit = tier_info["analyses"]
+        unsub_url = f"{FRONTEND_URL}/api/digest/unsubscribe?u={u.id}&t={digest_unsub_token(u.id)}"
         html = _digest_html(
             user_name=u.name or u.email.split("@")[0],
             tier_name=tier_info["name"],
             used=u.analyses_used,
             limit=limit,
+            unsub_url=unsub_url,
         )
         ok, err = await _send_resend_email(
             to=u.email,
