@@ -2035,8 +2035,39 @@ def verify_admin(x_admin_secret: Annotated[str, Header()] = ""):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-async def user_to_dict(u: User, db: AsyncSession) -> dict:
-    topup_remaining = await get_active_topup_credits(u.id, db)
+async def get_active_topup_credits_bulk(user_ids: list[str], db: AsyncSession) -> dict[str, int]:
+    """
+    One-shot lookup for active top-up credits for many users — replaces
+    N individual get_active_topup_credits() calls when serializing user
+    lists (avoids N+1 query pattern).
+
+    Returns a dict mapping user_id → total active credits. Users with no
+    active credits are NOT in the result; callers should default to 0.
+    """
+    if not user_ids:
+        return {}
+    result = await db.execute(
+        text("""
+            SELECT user_id, COALESCE(SUM(analyses_remaining), 0)::int AS total
+            FROM mollie_topup_credits
+            WHERE user_id = ANY(:ids)
+              AND expires_at > now()
+              AND analyses_remaining > 0
+            GROUP BY user_id
+        """),
+        {"ids": user_ids},
+    )
+    return {row.user_id: row.total for row in result}
+
+
+async def user_to_dict(u: User, db: AsyncSession, topup_remaining: Optional[int] = None) -> dict:
+    """
+    Serialize a User. If topup_remaining is provided (e.g. from a bulk
+    pre-fetch) it's used directly; otherwise we fall back to a per-user
+    SELECT for solo callers.
+    """
+    if topup_remaining is None:
+        topup_remaining = await get_active_topup_credits(u.id, db)
     return {
         "id":                       u.id,
         "email":                    u.email,
@@ -2074,7 +2105,10 @@ async def admin_list_users(
         window_start = datetime.now(timezone.utc) - timedelta(hours=registered_hours_ago + 1)
         stmt = stmt.where(User.created_at >= window_start, User.created_at <= window_end)
     result = await db.execute(stmt)
-    return [await user_to_dict(u, db) for u in result.scalars().all()]
+    users = result.scalars().all()
+    # Bulk-fetch topup credits for all users in a single query (avoids N+1).
+    topup_map = await get_active_topup_credits_bulk([u.id for u in users], db)
+    return [await user_to_dict(u, db, topup_remaining=topup_map.get(u.id, 0)) for u in users]
 
 @app.patch("/admin/users/{user_id}")
 @limiter.limit("30/minute")
