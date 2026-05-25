@@ -143,8 +143,7 @@ class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
     id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id    = Column(String, nullable=False, index=True)
-    token      = Column(String, unique=True, nullable=False, index=True,
-                        default=lambda: secrets.token_urlsafe(32))
+    token      = Column(String, unique=True, nullable=False, index=True)  # SHA-256 hash of plaintext token
     expires_at = Column(DateTime(timezone=True), nullable=False)
     used       = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -1634,14 +1633,16 @@ async def forgot_password(
             .where(PasswordResetToken.user_id == user.id, PasswordResetToken.used == False)
             .values(used=True)
         )
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
         reset_token = PasswordResetToken(
             user_id=user.id,
+            token=token_hash,
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         )
         db.add(reset_token)
         await db.commit()
-        await db.refresh(reset_token)
-        reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token.token}"
+        reset_link = f"{FRONTEND_URL}/reset-password?token={raw_token}"
         background_tasks.add_task(
             _send_email_bg,
             key="password_reset",
@@ -1656,9 +1657,10 @@ async def reset_password(request: Request, req: ResetPasswordRequest, db: AsyncS
     """Validate token and set new password."""
     if len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Wachtwoord moet minimaal 8 tekens zijn")
+    token_hash = hashlib.sha256(req.token.encode()).hexdigest()
     result = await db.execute(
         select(PasswordResetToken).where(
-            PasswordResetToken.token == req.token,
+            PasswordResetToken.token == token_hash,
             PasswordResetToken.used == False,
         )
     )
@@ -1678,7 +1680,7 @@ async def reset_password(request: Request, req: ResetPasswordRequest, db: AsyncS
         update(PasswordResetToken).where(PasswordResetToken.id == token_obj.id).values(used=True)
     )
     await db.commit()
-    log_security("password_reset_complete", user_id=user.id)
+    log_security("password_reset_complete", user_id=token_obj.user_id)
     return {"ok": True, "message": "Wachtwoord succesvol gewijzigd."}
 
 # ══════════════════════════════════════════════════════════════════════════════
