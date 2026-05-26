@@ -1517,6 +1517,11 @@ async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
                 user.email_verified = True  # Google verified the email
             await db.commit()
 
+    # Update name from Google if current name is missing or too short (e.g. "ik")
+    if user and name and len(name) > len(user.name or ""):
+        user.name = name
+        await db.commit()
+
     # 3. If still no user, create new account
     if not user:
         user = User(
