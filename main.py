@@ -20,6 +20,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import bcrypt as _bcrypt
 import jwt as _jwt
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, select, update, delete, text
 from sqlalchemy import func
@@ -45,6 +47,7 @@ CT_V2             = "https://clinicaltrials.gov/api/v2/studies"
 NCBI_API_KEY      = os.environ.get("NCBI_API_KEY", "")   # Register at: https://www.ncbi.nlm.nih.gov/account/
 REDIS_URL         = os.environ.get("REDIS_URL", "")
 ANALYSIS_CACHE_TTL = int(os.environ.get("ANALYSIS_CACHE_TTL", "86400"))  # 24h default
+GOOGLE_CLIENT_ID  = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 # NCBI key pool — add NCBI_API_KEY_2, NCBI_API_KEY_3 etc. for higher throughput
 _ncbi_key_pool = [k for name in ["NCBI_API_KEY", "NCBI_API_KEY_2", "NCBI_API_KEY_3"]
@@ -98,6 +101,7 @@ class User(Base):
     locked_until            = Column(DateTime(timezone=True), nullable=True)
     email_verified          = Column(Boolean, default=False)
     email_verification_token = Column(String, nullable=True)
+    google_id               = Column(String, nullable=True, unique=True)
     digest_subscribed       = Column(Boolean, default=True)
     created_at              = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -678,6 +682,7 @@ async def startup():
             "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN email_verification_token VARCHAR",
             "ALTER TABLE users ADD COLUMN digest_subscribed BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE users ADD COLUMN google_id VARCHAR UNIQUE",
         ]:
             try:
                 async with engine.begin() as conn:
@@ -1467,6 +1472,85 @@ async def register(request: Request, req: RegisterRequest, background_tasks: Bac
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Register error: {str(e)}")
+
+@app.post("/auth/google")
+@limiter.limit("10/minute")
+async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
+    """Authenticate with Google ID token. Creates account if new user."""
+    body = await request.json()
+    credential = body.get("credential", "")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Google credential ontbreekt")
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Google login niet geconfigureerd")
+
+    # Verify the Google ID token
+    try:
+        idinfo = google_id_token.verify_oauth2_token(
+            credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Ongeldig Google-token")
+
+    google_id = idinfo["sub"]
+    email = idinfo.get("email", "").lower().strip()
+    name = idinfo.get("name", email.split("@")[0])
+
+    if not email or not idinfo.get("email_verified"):
+        raise HTTPException(status_code=400, detail="Google-account heeft geen geverifieerd e-mailadres")
+
+    # 1. Check if user exists by google_id
+    result = await db.execute(select(User).where(User.google_id == google_id))
+    user = result.scalar_one_or_none()
+
+    # 2. If not found by google_id, check by email (link existing account)
+    if not user:
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+        if user:
+            # Link Google to existing account
+            user.google_id = google_id
+            if not user.email_verified:
+                user.email_verified = True  # Google verified the email
+            await db.commit()
+
+    # 3. If still no user, create new account
+    if not user:
+        user = User(
+            email=email,
+            name=name,
+            password_hash="GOOGLE_OAUTH",  # No password — Google-only auth
+            tier="free",
+            google_id=google_id,
+            email_verified=True,  # Google verified the email
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        log_security("google_registration", user_id=user.id, email=user.email)
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account geblokkeerd")
+
+    # Reset any lockout
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    await db.commit()
+
+    access_token = create_token(user.id, user.email)
+    refresh_token = await create_refresh_token(user.id, db)
+    tier_info = TIERS.get(user.tier, TIERS["free"])
+    topup_remaining = await get_active_topup_credits(user.id, db)
+    log_security("google_login", user_id=user.id, email=user.email, tier=user.tier)
+    return {
+        "token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": JWT_EXPIRE_MINUTES * 60,
+        "user": {"id": user.id, "email": user.email, "name": user.name,
+                 "tier": user.tier, "tier_name": tier_info["name"],
+                 "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"],
+                 "topup_credits_remaining": topup_remaining},
+    }
 
 @app.post("/auth/login")
 @limiter.limit("5/minute")
