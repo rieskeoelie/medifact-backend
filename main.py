@@ -1080,10 +1080,11 @@ Rules:
 4. Consumer language (e.g. "blood thinners") → precise MeSH ("Anticoagulants").
 5. Headlines/full sentences → extract core medical claim, convert to search query.
 6. Abbreviations → expand to full MeSH term (e.g. "MI" → "Myocardial Infarction").
-7. Return ONLY valid JSON, no preamble.
+7. has_relationship: true if the input contains a verb or relationship between substance and outcome (e.g. "cures", "prevents", "supports", "causes"). false if it is just bare keywords (e.g. "fenbendazole cancer", "vitamine D immuun").
+8. Return ONLY valid JSON, no preamble.
 
 Output schema (ALWAYS exactly this):
-{"normalized": "<MeSH query or empty>", "is_medical": true|false, "mesh_terms": ["term1",...], "reason": "<1 sentence>"}"""
+{"normalized": "<MeSH query or empty>", "is_medical": true|false, "mesh_terms": ["term1",...], "reason": "<1 sentence>", "has_relationship": true|false}"""
 
 # ── Medifact DOMAIN PROFILE ─────────────────────────────────────────────────────────
 PROFILE = {"v": 15, "r": 70, "c": 15, "s": 2, "q": 8, "i": 5, "a": 90, "p": 2,
@@ -1926,6 +1927,7 @@ async def normalize_query(req: NormalizeRequest, current_user: User = Depends(ge
         "is_medical": bool(result.get("is_medical", True)),
         "mesh_terms": result.get("mesh_terms", []),
         "reason": result.get("reason", ""),
+        "has_relationship": bool(result.get("has_relationship", True)),
     }
 
 @app.post("/api/analyze")
