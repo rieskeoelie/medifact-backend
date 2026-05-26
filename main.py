@@ -102,6 +102,7 @@ class User(Base):
     email_verified          = Column(Boolean, default=False)
     email_verification_token = Column(String, nullable=True)
     google_id               = Column(String, nullable=True, unique=True)
+    avatar_url              = Column(String, nullable=True)
     digest_subscribed       = Column(Boolean, default=True)
     created_at              = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -683,6 +684,7 @@ async def startup():
             "ALTER TABLE users ADD COLUMN email_verification_token VARCHAR",
             "ALTER TABLE users ADD COLUMN digest_subscribed BOOLEAN DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN google_id VARCHAR UNIQUE",
+            "ALTER TABLE users ADD COLUMN avatar_url VARCHAR",
         ]:
             try:
                 async with engine.begin() as conn:
@@ -1498,6 +1500,7 @@ async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
     given = idinfo.get("given_name", "")
     family = idinfo.get("family_name", "")
     name = f"{given} {family}".strip() if (given or family) else idinfo.get("name", email.split("@")[0])
+    picture = idinfo.get("picture", "")
 
     if not email or not idinfo.get("email_verified"):
         raise HTTPException(status_code=400, detail="Google-account heeft geen geverifieerd e-mailadres")
@@ -1517,10 +1520,17 @@ async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
                 user.email_verified = True  # Google verified the email
             await db.commit()
 
-    # Update name from Google if current name is missing or too short (e.g. "ik")
-    if user and name and len(name) > len(user.name or ""):
-        user.name = name
-        await db.commit()
+    # Update name and avatar from Google if current values are missing/short
+    if user:
+        changed = False
+        if name and len(name) > len(user.name or ""):
+            user.name = name
+            changed = True
+        if picture and not user.avatar_url:
+            user.avatar_url = picture
+            changed = True
+        if changed:
+            await db.commit()
 
     # 3. If still no user, create new account
     if not user:
@@ -1530,6 +1540,7 @@ async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
             password_hash="GOOGLE_OAUTH",  # No password — Google-only auth
             tier="free",
             google_id=google_id,
+            avatar_url=picture or None,
             email_verified=True,  # Google verified the email
         )
         db.add(user)
@@ -1557,7 +1568,8 @@ async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
         "user": {"id": user.id, "email": user.email, "name": user.name,
                  "tier": user.tier, "tier_name": tier_info["name"],
                  "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"],
-                 "topup_credits_remaining": topup_remaining},
+                 "topup_credits_remaining": topup_remaining,
+                 "avatar_url": user.avatar_url},
     }
 
 @app.post("/auth/login")
@@ -1602,7 +1614,8 @@ async def login(request: Request, req: LoginRequest, db: AsyncSession = Depends(
         "user": {"id": user.id, "email": user.email, "name": user.name,
                  "tier": user.tier, "tier_name": tier_info["name"],
                  "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"],
-                 "topup_credits_remaining": topup_remaining},
+                 "topup_credits_remaining": topup_remaining,
+                 "avatar_url": user.avatar_url},
     }
 
 @app.get("/auth/verify-email")
@@ -1651,7 +1664,8 @@ async def refresh_token(request: Request, db: AsyncSession = Depends(get_db)):
         "user": {"id": user.id, "email": user.email, "name": user.name,
                  "tier": user.tier, "tier_name": tier_info["name"],
                  "analyses_used": user.analyses_used, "analyses_limit": tier_info["analyses"],
-                 "topup_credits_remaining": topup_remaining},
+                 "topup_credits_remaining": topup_remaining,
+                 "avatar_url": user.avatar_url},
     }
 
 @app.post("/auth/logout")
@@ -1704,8 +1718,48 @@ async def me(current_user: User = Depends(get_current_user), db: AsyncSession = 
         "tier_price": tier_info["price"],
         "analyses_used": current_user.analyses_used, "analyses_limit": tier_info["analyses"],
         "topup_credits_remaining": topup_remaining,
+        "avatar_url": current_user.avatar_url,
         "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
     }
+
+@app.put("/auth/avatar")
+@limiter.limit("10/minute")
+async def update_avatar(request: Request, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Upload or update profile avatar. Accepts base64 data URI or URL."""
+    body = await request.json()
+    avatar_url = body.get("avatar_url", "")
+
+    if not avatar_url:
+        # Allow clearing avatar
+        current_user.avatar_url = None
+        await db.commit()
+        return {"avatar_url": None}
+
+    # Validate: must be a data URI or https URL
+    if avatar_url.startswith("data:image/"):
+        # Limit base64 size to ~500KB (after base64 encoding ~= 375KB image)
+        if len(avatar_url) > 500_000:
+            raise HTTPException(status_code=400, detail="Afbeelding te groot (max 500KB)")
+        # Validate it's a supported image type
+        if not any(avatar_url.startswith(f"data:image/{t}") for t in ["jpeg", "png", "webp", "gif"]):
+            raise HTTPException(status_code=400, detail="Ongeldig bestandstype (gebruik JPEG, PNG, WebP of GIF)")
+    elif avatar_url.startswith("https://"):
+        if len(avatar_url) > 2000:
+            raise HTTPException(status_code=400, detail="URL te lang")
+    else:
+        raise HTTPException(status_code=400, detail="Ongeldige avatar URL")
+
+    current_user.avatar_url = avatar_url
+    await db.commit()
+    return {"avatar_url": current_user.avatar_url}
+
+@app.delete("/auth/avatar")
+@limiter.limit("10/minute")
+async def delete_avatar(request: Request, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Remove profile avatar."""
+    current_user.avatar_url = None
+    await db.commit()
+    return {"avatar_url": None}
 
 @app.post("/auth/forgot-password")
 @limiter.limit("3/minute")
@@ -2192,6 +2246,7 @@ async def user_to_dict(u: User, db: AsyncSession, topup_remaining: Optional[int]
         "analyses_used":            u.analyses_used,
         "analyses_limit":           TIERS.get(u.tier, {}).get("analyses", 10),
         "topup_credits_remaining":  topup_remaining,
+        "avatar_url":               u.avatar_url,
         "is_active":                u.is_active,
         "stripe_sub_id":            u.stripe_sub_id,
         "created_at":               u.created_at.isoformat() if u.created_at else None,
