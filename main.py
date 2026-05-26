@@ -67,7 +67,7 @@ STRIPE_PRICE_BUSINESS       = os.environ.get("STRIPE_PRICE_BUSINESS", "")
 # Canonical tiers (April 2026): free / pro / team / enterprise
 # Legacy tiers (solo / professional / business) blijven voor grandfathered bestaande klanten
 TIERS = {
-    "free":         {"name": "Gratis",       "analyses": 5,      "price": 0,   "seats": 1,      "stripe_price": None},
+    "free":         {"name": "Gratis",       "analyses": 10,     "price": 0,   "seats": 1,      "stripe_price": None},
     "pro":          {"name": "Pro",          "analyses": 50,     "price": 99,  "seats": 1,      "stripe_price": None},
     "team":         {"name": "Team",         "analyses": 300,    "price": 349, "seats": 10,     "stripe_price": None},
     "enterprise":   {"name": "Enterprise",   "analyses": 999999, "price": 1500,"seats": 999999, "stripe_price": None},
@@ -1494,7 +1494,10 @@ async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
 
     google_id = idinfo["sub"]
     email = idinfo.get("email", "").lower().strip()
-    name = idinfo.get("name", email.split("@")[0])
+    # Prefer given_name + family_name for better accuracy, fallback to name, then email prefix
+    given = idinfo.get("given_name", "")
+    family = idinfo.get("family_name", "")
+    name = f"{given} {family}".strip() if (given or family) else idinfo.get("name", email.split("@")[0])
 
     if not email or not idinfo.get("email_verified"):
         raise HTTPException(status_code=400, detail="Google-account heeft geen geverifieerd e-mailadres")
