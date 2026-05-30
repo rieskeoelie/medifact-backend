@@ -1,0 +1,6 @@
+# Nixpacks build customization.
+# The "..." token preserves Nixpacks' auto-detected packages (Python, etc.)
+# and appends postgresql_16, which provides the `pg_dump` binary (v16) used by
+# the /cron/backup-db endpoint. pg_dump must be >= the server version (postgres 16).
+[phases.setup]
+nixPkgs = ["...", "postgresql_16"]

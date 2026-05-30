@@ -28,3 +28,6 @@ slowapi>=0.1.9
 
 # Cache & distributed state
 redis[asyncio]>=5.0.0
+
+# Off-site DB backups (Cloudflare R2, S3-compatible)
+boto3>=1.35.0

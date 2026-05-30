@@ -49,6 +49,18 @@ REDIS_URL         = os.environ.get("REDIS_URL", "")
 ANALYSIS_CACHE_TTL = int(os.environ.get("ANALYSIS_CACHE_TTL", "86400"))  # 24h default
 GOOGLE_CLIENT_ID  = os.environ.get("GOOGLE_CLIENT_ID", "")
 
+# Raw libpq connection string for pg_dump (SQLAlchemy uses the asyncpg variant above).
+# pg_dump expects a standard postgresql:// URL, not postgresql+asyncpg://.
+DATABASE_URL_RAW  = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://")
+
+# Cloudflare R2 (S3-compatible) — off-site database backup target.
+# Set these on the Railway backend service. If unset, /cron/backup-db no-ops.
+R2_ACCOUNT_ID        = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID     = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET            = os.environ.get("R2_BUCKET", "medifact-db-backups")
+BACKUP_RETENTION_DAYS = int(os.environ.get("BACKUP_RETENTION_DAYS", "30"))
+
 # NCBI key pool — add NCBI_API_KEY_2, NCBI_API_KEY_3 etc. for higher throughput
 _ncbi_key_pool = [k for name in ["NCBI_API_KEY", "NCBI_API_KEY_2", "NCBI_API_KEY_3"]
                   if (k := os.environ.get(name, ""))]
@@ -2747,6 +2759,79 @@ async def test_email(
         "resend_api_key_set": bool(RESEND_API_KEY),
         "from_email": FROM_EMAIL,
     }
+
+
+@app.post("/cron/backup-db")
+async def backup_db(request: Request):
+    """
+    Daily off-site database backup: pg_dump → Cloudflare R2.
+    Protected by CRON_SECRET header: Authorization: Bearer <CRON_SECRET>.
+    Trigger daily from cron-job.org. No-ops (200) if R2 is not configured.
+
+    Restore with:
+        pg_restore --clean --no-owner --no-privileges -d "$DATABASE_URL" medifact-YYYYMMDD-HHMMSS.dump
+    """
+    auth = request.headers.get("authorization", "")
+    if not CRON_SECRET:
+        raise HTTPException(status_code=500, detail="CRON_SECRET not configured")
+    if auth != f"Bearer {CRON_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not DATABASE_URL_RAW.startswith("postgresql://"):
+        # SQLite / local dev — nothing to back up.
+        return {"ok": False, "skipped": "not a postgres database"}
+    if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET):
+        return {"ok": False, "skipped": "R2 not configured"}
+
+    import tempfile
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    key = f"backups/medifact-{ts}.dump"
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"medifact-{ts}.dump")
+    try:
+        # 1. pg_dump → compressed custom-format file (out-of-band, no shell injection risk).
+        proc = await asyncio.create_subprocess_exec(
+            "pg_dump", "--format=custom", "--no-owner", "--no-privileges",
+            "--file", tmp_path, DATABASE_URL_RAW,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = (stderr.decode(errors="replace") if stderr else "").strip()[:500]
+            log_security("backup_db_dump_failed", error=err)
+            raise HTTPException(status_code=500, detail=f"pg_dump failed: {err}")
+
+        size = os.path.getsize(tmp_path)
+
+        # 2. Upload to R2 + prune old dumps (boto3 is sync → run off the event loop).
+        def _upload_and_prune() -> int:
+            import boto3
+            client = boto3.client(
+                "s3",
+                endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                region_name="auto",
+            )
+            client.upload_file(tmp_path, R2_BUCKET, key)
+
+            pruned = 0
+            cutoff = datetime.now(timezone.utc) - timedelta(days=BACKUP_RETENTION_DAYS)
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=R2_BUCKET, Prefix="backups/"):
+                for obj in page.get("Contents", []):
+                    if obj["Key"] != key and obj["LastModified"] < cutoff:
+                        client.delete_object(Bucket=R2_BUCKET, Key=obj["Key"])
+                        pruned += 1
+            return pruned
+
+        pruned = await asyncio.to_thread(_upload_and_prune)
+        return {"ok": True, "key": key, "bytes": size, "pruned": pruned}
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
