@@ -50,8 +50,13 @@ ANALYSIS_CACHE_TTL = int(os.environ.get("ANALYSIS_CACHE_TTL", "86400"))  # 24h d
 GOOGLE_CLIENT_ID  = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 # Raw libpq connection string for pg_dump (SQLAlchemy uses the asyncpg variant above).
-# pg_dump expects a standard postgresql:// URL, not postgresql+asyncpg://.
-DATABASE_URL_RAW  = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://")
+# pg_dump expects a standard postgresql:// URL — not postgresql+asyncpg:// (the async
+# driver form Railway/SQLAlchemy use) and not the legacy postgres:// scheme.
+DATABASE_URL_RAW  = (
+    os.environ.get("DATABASE_URL", "")
+    .replace("postgresql+asyncpg://", "postgresql://")
+    .replace("postgres://", "postgresql://")
+)
 
 # Cloudflare R2 (S3-compatible) — off-site database backup target.
 # Set these on the Railway backend service. If unset, /cron/backup-db no-ops.
