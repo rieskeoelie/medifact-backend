@@ -49,6 +49,12 @@ REDIS_URL         = os.environ.get("REDIS_URL", "")
 ANALYSIS_CACHE_TTL = int(os.environ.get("ANALYSIS_CACHE_TTL", "86400"))  # 24h default
 GOOGLE_CLIENT_ID  = os.environ.get("GOOGLE_CLIENT_ID", "")
 
+# Feature flag: nieuwe gebruikersregistratie open/dicht (project in de ijskast).
+# Bestaande gebruikers (mail + Google) blijven gewoon inloggen — alleen het AANMAKEN
+# van een nieuw account is geblokkeerd. Weer aanzetten: set REGISTRATION_OPEN=true.
+REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
+REGISTRATION_CLOSED_MSG = "Aanmelden is tijdelijk gesloten. Bestaande gebruikers kunnen wel inloggen."
+
 # Raw libpq connection string for pg_dump (SQLAlchemy uses the asyncpg variant above).
 # pg_dump expects a standard postgresql:// URL — not postgresql+asyncpg:// (the async
 # driver form Railway/SQLAlchemy use) and not the legacy postgres:// scheme.
@@ -1447,6 +1453,8 @@ def meta_check(results: list[AxisResult]) -> tuple[str, str]:
 @app.post("/auth/register")
 @limiter.limit("3/minute")
 async def register(request: Request, req: RegisterRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+    if not REGISTRATION_OPEN:
+        raise HTTPException(status_code=403, detail=REGISTRATION_CLOSED_MSG)
     try:
         if len(req.password) < 8:
             raise HTTPException(status_code=400, detail="Wachtwoord moet minimaal 8 tekens zijn")
@@ -1550,8 +1558,13 @@ async def google_auth(request: Request, db: AsyncSession = Depends(get_db)):
         if changed:
             await db.commit()
 
-    # 3. If still no user, create new account
+    # 3. If still no user, create new account — UNLESS registration is closed.
+    #    Bestaande Google-users + email→Google-link werken hierboven al; alleen
+    #    een echt nieuwe gebruiker mag niet aangemaakt worden.
     if not user:
+        if not REGISTRATION_OPEN:
+            log_security("google_registration_blocked", email=email)
+            raise HTTPException(status_code=403, detail=REGISTRATION_CLOSED_MSG)
         user = User(
             email=email,
             name=name,
